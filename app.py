@@ -1,39 +1,108 @@
 import streamlit as st
 import pandas as pd
+import base64
+import re
+from difflib import get_close_matches
 from gemini_client import (
     generate_code,
     refine_code,
     get_dependencies,
     refine_dependencies,
-    improve_code
+    improve_code,
+    generate_code_name
 )
 from code_formatter import clean_code, format_output
 from docker_executor import execute_code_in_docker, initialize_docker_image
-from file_formatter import format_generated_file  # Para formatear CSV, imágenes, etc.
+from file_formatter import format_generated_file
 import os
 import time
+from io import BytesIO
 
-# =========================================
-# ========== CONFIGURACIÓN Y UI ===========
-# =========================================
+# =============================================================================
+# ====================== FUNCIONES AUXILIARES ==================================
+# =============================================================================
+
+def get_file_icon(filename):
+    """Devuelve un ícono basado en la extensión del archivo."""
+    ext = filename.lower().split('.')[-1]
+    icons = {
+        'csv': "📄", 'xlsx': "📊", 'xls': "📊", 'png': "🖼️", 'jpg': "🖼️",
+        'jpeg': "🖼️", 'gif': "🖼️", 'md': "📝", 'html': "📝", 'txt': "📄",
+        'mp4': "🎞️", 'mov': "🎞️", 'avi': "🎞️", 'webm': "🎞️", 'pdf': "📕"
+    }
+    return icons.get(ext, "📁")
+
+def encode_image_to_base64(image_content):
+    """Codifica el contenido de la imagen en base64."""
+    return base64.b64encode(image_content).decode('utf-8')
+
+def find_best_image_match(ref_name, image_files):
+    """
+    Encuentra la mejor coincidencia de imagen basada en el nombre referenciado,
+    usando coincidencias parciales e insensibles a mayúsculas/minúsculas.
+    """
+    image_names = list(image_files.keys())
+    matches = get_close_matches(ref_name, image_names, n=1, cutoff=0.6)
+    if matches:
+        return matches[0]
+    return None
+
+def partition_markdown_with_images(md_report, image_files):
+    """
+    Particiona el Markdown, detecta referencias a imágenes, e inserta
+    la imagen correspondiente en base64.
+    """
+    # Expresión regular para detectar referencias a imágenes en Markdown
+    image_ref_pattern = r'!\[.*?\]\((.*?)\)'
+    parts = []
+    last_pos = 0
+
+    # Buscar todas las referencias a imágenes
+    for match in re.finditer(image_ref_pattern, md_report):
+        start, end = match.span()
+        ref_name = match.group(1)  # Nombre de la imagen referenciada
+
+        # Agregar el texto antes de la referencia
+        parts.append(md_report[last_pos:start])
+
+        # Encontrar la mejor coincidencia de imagen
+        best_match = find_best_image_match(ref_name, image_files)
+        if best_match:
+            b64 = encode_image_to_base64(image_files[best_match])
+            # Insertar la imagen en base64
+            parts.append(f"![{best_match}](data:image/png;base64,{b64})")
+        else:
+            # Si no hay coincidencia, mantener la referencia original
+            parts.append(md_report[start:end])
+
+        last_pos = end
+
+    # Agregar el texto restante
+    parts.append(md_report[last_pos:])
+    return ''.join(parts)
+
+# =============================================================================
+# ====================== CONFIGURACIÓN Y UI ===================================
+# =============================================================================
 
 st.set_page_config(page_title="AI Code Docker Executor", layout="wide")
 
-# Inicializamos el entorno Docker una sola vez
+# Inicializar entorno Docker una sola vez
 if "docker_initialized" not in st.session_state:
     with st.spinner("Inicializando entorno Docker..."):
         docker_init_msg = initialize_docker_image()
-        st.write(docker_init_msg)  # Mostrar mensaje de inicialización
+    st.write(docker_init_msg)
     st.session_state["docker_initialized"] = True
 
-# Panel lateral de configuraciones
+# Panel de configuración en la barra lateral
 with st.sidebar:
-    st.header("Configuración Gemini")
+    st.header("Configuración de Gemini")
     MODEL_OPTIONS = [
         "gemini-2.0-flash-lite-preview-02-05",
         "gemini-2.0-flash-001",
         "gemini-2.0-flash-exp",
-        "gemini-2.0-flash-thinking-exp-01-21"
+        "gemini-2.0-flash-thinking-exp-01-21",
+        "gemini-2.0-pro-exp-02-05"
     ]
     selected_model = st.selectbox(
         "Modelo de Gemini:",
@@ -43,100 +112,82 @@ with st.sidebar:
 
     st.header("Parámetros de Ejecución")
     max_attempts = st.number_input(
-        "Máx. intentos de refinamiento (errores)",
+        "Máximo de intentos de refinamiento (errores)",
         min_value=1,
         max_value=10,
         value=5
     )
     improvement_iterations = st.number_input(
-        "Iteraciones de mejora",
-        min_value=1,
+        "Iteraciones iniciales de mejora",
+        min_value=0,
         max_value=10,
         value=1,
-        help="Número de veces que Gemini revisará y mejorará el código tras ejecución exitosa."
+        help="Número de veces que el código se refinará tras generarse para asegurar resultados correctos."
     )
 
-# Variables de sesión para almacenar el flujo
+# Variables de estado de la sesión
 if "generated" not in st.session_state:
-    st.session_state["generated"] = False  # Indica si ya se generó código
+    st.session_state["generated"] = False
 if "versions" not in st.session_state:
-    # Cada elemento es un dict con información de cada versión generada
     st.session_state["versions"] = []
-# Se elimina la generación de nombre descriptivo; se usará un nombre por defecto.
 if "base_name" not in st.session_state:
-    st.session_state["base_name"] = "Codigo"
+    st.session_state["base_name"] = "Code"
 if "version_counter" not in st.session_state:
     st.session_state["version_counter"] = 1
 if "last_status" not in st.session_state:
-    st.session_state["last_status"] = ""  # OK, CODE, DEPENDENCY, BOTH, etc.
+    st.session_state["last_status"] = ""
 if "log_history" not in st.session_state:
     st.session_state["log_history"] = ""
 if "input_files" not in st.session_state:
     st.session_state["input_files"] = {}
 
 def get_current_version_label():
-    """
-    Devuelve la etiqueta en formato 'Codigo vX'
-    """
+    """Devuelve la etiqueta de versión en formato 'Code vX'."""
     return f"{st.session_state['base_name']} v{st.session_state['version_counter']}"
 
 def validate_execution(outputs):
+    """Valida la ejecución del código en Docker revisando errores comunes."""
     combined_output = outputs.get("stdout", "") + outputs.get("stderr", "")
-    
-    # Si se detecta "ModuleNotFoundError", se considera que falta una dependencia
     if "ModuleNotFoundError" in combined_output:
-        return "DEPENDENCY", "Error en la generación de dependencias: módulo no encontrado."
-    
-    dependency_error = False
-    code_error = False
+        return "DEPENDENCY", "Error en dependencias: módulo no encontrado."
+    if "SyntaxError" in combined_output or "invalid syntax" in combined_output:
+        return "CODE", "Error en el código: sintaxis inválida."
+    if "Traceback" in combined_output:
+        return "CODE", "Error en el código: excepción detectada."
+    if "No matching distribution found" in combined_output:
+        return "DEPENDENCY", "Error en dependencias: distribución no encontrada."
+    return "OK", "Código ejecutado exitosamente."
 
-    # Detectar errores de dependencias comunes
-    if ("Could not find a version that satisfies" in combined_output or
-        "No matching distribution found" in combined_output):
-        dependency_error = True
-
-    # Detectar errores de sintaxis o de ejecución en el código
-    if ("SyntaxError" in combined_output or
-        "invalid syntax" in combined_output or
-        "Traceback" in combined_output):
-        code_error = True
-
-    if not dependency_error and not code_error:
-        return "OK", "El código se ejecutó correctamente."
-    if dependency_error and code_error:
-        return "BOTH", "Se detectaron errores en dependencias y en el código."
-    if dependency_error:
-        return "DEPENDENCY", "Error en la generación de dependencias."
-    if code_error:
-        return "CODE", "Error en el código."
-
-# =========================================
-# =========== LÓGICA PRINCIPAL ============
-# =========================================
+# =============================================================================
+# ====================== LÓGICA PRINCIPAL ======================================
+# =============================================================================
 
 st.title("AI Code Docker Executor")
 st.markdown(
-    "Genera y refina código Python usando la API de Gemini y ejecútalo en un "
-    "entorno aislado (Docker) con validación y retroalimentación automática."
+    "Genera y refina código Python usando la API de Gemini y ejecútalo en un entorno aislado (Docker) "
+    "con validación automática y retroalimentación."
 )
 
-# Sección de entrada de datos (prompt + archivos)
+log_placeholder = st.empty()
+status_placeholder = st.empty()
+
+def update_status(message):
+    """Actualiza el mensaje de estado en la interfaz."""
+    status_placeholder.markdown(f"- {message}")
+
+# Sección de entrada (prompt + archivos)
 with st.expander("Instrucciones y Archivos Adjuntos", expanded=True):
     user_instruction = st.text_area(
         "Instrucción (prompt) para generar código Python:",
-        placeholder="Ejemplo: Analiza las ventas de un archivo Excel y crea un gráfico de barras comparando las ventas por producto."
+        placeholder="Ejemplo: Analiza ventas desde un archivo Excel y crea un gráfico de barras comparando ventas por producto."
     )
-
     uploaded_files = st.file_uploader(
         "Sube uno o varios archivos (opcional)",
         accept_multiple_files=True,
-        help="Los archivos adjuntos se ubicarán en el mismo directorio que el script y serán analizados por Gemini."
+        help="Los archivos adjuntos se colocarán en el mismo directorio que el script."
     )
 
-# Placeholder para mensajes y logs en tiempo real
-log_placeholder = st.empty()
-
-# Botón para generar y ejecutar el código
+# Botón para generar y ejecutar código
 if st.button("Generar y Ejecutar Código"):
     if not user_instruction.strip():
         st.error("Por favor, ingresa una instrucción antes de generar el código.")
@@ -149,11 +200,10 @@ if st.button("Generar y Ejecutar Código"):
         st.session_state["log_history"] = ""
         st.session_state["input_files"] = {}
 
-        log_placeholder.info("Procesando archivos adjuntos...")
-        # Procesar archivos
+        update_status("Procesando archivos adjuntos...")
         input_files = {}
         resumen_archivos = ""
-        for file in uploaded_files:
+        for file in uploaded_files or []:
             file.seek(0)
             try:
                 if file.name.lower().endswith(".csv"):
@@ -171,83 +221,120 @@ if st.button("Generar y Ejecutar Código"):
                 else:
                     content = file.read()
                     input_files[file.name] = content
-                    resumen_archivos += f"\nArchivo {file.name}: Se adjunta para uso en el código.\n"
+                    resumen_archivos += f"\nArchivo {file.name}: Adjuntado para uso en el código.\n"
             except Exception as e:
                 resumen_archivos += f"\nNo se pudo procesar {file.name}: {e}\n"
-        st.session_state["input_files"] = input_files
-        log_placeholder.success("Archivos procesados correctamente.")
 
-        # Construir prompt para generar código
+        st.session_state["input_files"] = input_files
+        update_status("Archivos procesados exitosamente.")
+
+        # Construir prompt para generación de código
         prompt = f"Instrucción del usuario:\n{user_instruction}\n"
         if resumen_archivos:
             prompt += f"\nInformación de archivos adjuntos:\n{resumen_archivos}\n"
         prompt += (
-            "\nGenerate **only the complete Python code** that solves the user's instruction, "
-            "ready to be executed in an isolated environment (Docker). Do not include explanatory comments, "
-            "additional text, or code delimiters. Ensure that the code is directly executable and functional. "
-            "The code should generate images when appropriate; for each image, it must save the image file to the "
-            "project's root directory."
+            "\nGenera el código Python completo que resuelva la instrucción del usuario, listo para ejecutarse en un entorno aislado (Docker). "
+            "Asegúrate de que el código sea funcional y directamente ejecutable. Si es apropiado, genera imágenes y guárdalas como archivos PNG en el directorio raíz."
         )
 
-        # Generación de código inicial
+        # Generación inicial del código
         with st.spinner("Generando código con Gemini..."):
             try:
                 code_generated = generate_code(prompt, model_name=selected_model)
                 code_generated = clean_code(code_generated)
-                st.success("Código generado exitosamente.")
+                update_status("Código generado exitosamente.")
             except Exception as e:
-                st.error(f"Error al generar código: {e}")
+                st.error(f"Error generando código: {e}")
                 st.stop()
+
+        # Mejora inicial del código
+        current_code = code_generated
+        if improvement_iterations > 0:
+            improvement_prompt = (
+                "Asegúrate de que el código genere correctamente imágenes o gráficos y los guarde como archivos PNG."
+            )
+            for i in range(int(improvement_iterations)):
+                with st.spinner(f"Mejorando código (iteración {i+1}/{int(improvement_iterations)})..."):
+                    try:
+                        new_code = improve_code(current_code, improvement_prompt, model_name=selected_model)
+                        new_code = clean_code(new_code)
+                        if new_code.strip() == current_code.strip():
+                            update_status("No se detectaron mejoras en esta iteración.")
+                            break
+                        current_code = new_code
+                    except Exception as e:
+                        st.error(f"Error en iteración de mejora inicial: {e}")
+                        break
 
         # Guardar primera versión
         version_label = get_current_version_label()
         st.session_state["versions"].append({
             "label": version_label,
-            "code": code_generated,
+            "code": current_code,
             "dependencies": "",
             "logs": "",
             "stdout": "",
             "stderr": "",
             "files": {}
         })
-        log_placeholder.info(f"Guardada versión inicial: {version_label}")
+        update_status(f"Guardada versión inicial: {version_label}")
 
         # Obtener dependencias
-        with st.spinner("Obteniendo listado de dependencias necesarias..."):
+        with st.spinner("Obteniendo lista de dependencias requeridas..."):
             try:
-                dependencies = get_dependencies(code_generated, model_name=selected_model)
+                dependencies = get_dependencies(current_code, model_name=selected_model)
                 dependencies = clean_code(dependencies)
-                st.success("Dependencias obtenidas.")
+                update_status("Dependencias obtenidas.")
             except Exception as e:
-                st.error(f"Error al obtener dependencias: {e}")
+                st.error(f"Error obteniendo dependencias: {e}")
                 st.stop()
 
-        # Actualizar dependencias en la versión inicial
         st.session_state["versions"][-1]["dependencies"] = dependencies
 
-        # Bucle de validación e iteración
-        codigo_actual = code_generated
+        # Ciclo de validación y refinamiento
+        codigo_actual = current_code
         deps_actuales = dependencies
         logs_accum = ""
         for intento in range(1, int(max_attempts) + 1):
-            log_placeholder.info(f"Iniciando ejecución en contenedor Docker (intento {intento})...")
-            with st.spinner(f"Ejecutando código en contenedor Docker (intento {intento})..."):
+            update_status(f"Iniciando ejecución en contenedor Docker (intento {intento})...")
+            with st.spinner(f"Ejecutando código en Docker (intento {intento})..."):
                 outputs = execute_code_in_docker(codigo_actual, input_files, deps_actuales)
             status, msg = validate_execution(outputs)
             logs_accum += f"Validación: {status} - {msg}\n"
-            # Actualizar logs en la versión actual
             st.session_state["versions"][-1]["logs"] = logs_accum
             st.session_state["versions"][-1]["stdout"] = outputs.get("stdout", "")
             st.session_state["versions"][-1]["stderr"] = outputs.get("stderr", "")
             st.session_state["versions"][-1]["files"] = outputs.get("files", {})
 
-            log_placeholder.info(f"Intento {intento}: {msg}")
-            # Actualización en tiempo real del log
-            log_placeholder.text(logs_accum)
-            time.sleep(0.5)  # Pausa breve para actualizar la UI
+            update_status(f"Validación: {status} - {msg}")
+            time.sleep(0.5)
 
             if status == "OK":
                 st.session_state["last_status"] = "OK"
+                # Generar reporte Markdown solo si la ejecución fue exitosa
+                with st.spinner("Generando reporte Markdown de resultados con Gemini..."):
+                    image_files = {fname: fcontent for fname, fcontent in outputs.get("files", {}).items()
+                                   if fname.lower().endswith((".png", ".jpg", ".jpeg", ".gif"))}
+                    report_prompt = (
+                        "Basándote en los siguientes resultados de ejecución, genera un informe completo en Markdown que explique los resultados "
+                        "de manera clara y científica, incluyendo secciones como Introducción, Metodología, Resultados y Conclusión. "
+                        "Incluye referencias a las imágenes generadas usando la sintaxis de Markdown, por ejemplo: ![Descripción](nombre_imagen.png).\n\n"
+                        "Resultados de ejecución:\n"
+                        f"STDOUT: {outputs.get('stdout', '')}\n"
+                        f"STDERR: {outputs.get('stderr', '')}\n"
+                        f"Logs: {logs_accum}\n"
+                        f"Código Generado:\n{codigo_actual}\n"
+                        f"Imágenes generadas (usa estos nombres en el reporte): {', '.join(image_files.keys())}\n"
+                    )
+                    try:
+                        md_report = generate_code(report_prompt, model_name=selected_model)
+                        md_report = clean_code(md_report)
+                        # Procesar el Markdown para incrustar imágenes
+                        md_report = partition_markdown_with_images(md_report, image_files)
+                        update_status("Reporte Markdown generado por Gemini.")
+                    except Exception as e:
+                        st.error(f"Error generando reporte Markdown: {e}")
+                        md_report = "Error al generar el reporte Markdown."
                 break
             elif status == "DEPENDENCY":
                 st.session_state["last_status"] = "DEPENDENCY"
@@ -257,10 +344,9 @@ if st.button("Generar y Ejecutar Código"):
                         new_deps = clean_code(new_deps)
                         deps_actuales = new_deps
                         st.session_state["versions"][-1]["dependencies"] = deps_actuales
-                        log_placeholder.info("Dependencias refinadas.")
+                        update_status("Dependencias refinadas.")
                     except Exception as e:
-                        logs_accum += f"Error al refinar dependencias: {e}\n"
-                        log_placeholder.error(f"Error al refinar dependencias: {e}")
+                        logs_accum += f"Error refinando dependencias: {e}\n"
                         break
             elif status == "CODE":
                 st.session_state["last_status"] = "CODE"
@@ -280,160 +366,94 @@ if st.button("Generar y Ejecutar Código"):
                             "files": {}
                         })
                         codigo_actual = new_code
-                        log_placeholder.info(f"Código refinado: {version_label}")
+                        update_status(f"Código refinado: {version_label}")
                     except Exception as e:
-                        logs_accum += f"Error al refinar código: {e}\n"
-                        log_placeholder.error(f"Error al refinar código: {e}")
+                        logs_accum += f"Error refinando código: {e}\n"
                         break
-            elif status == "BOTH":
-                st.session_state["last_status"] = "BOTH"
-                with st.spinner("Refinando dependencias y código..."):
-                    try:
-                        new_deps = refine_dependencies(deps_actuales, codigo_actual, outputs, model_name=selected_model)
-                        new_deps = clean_code(new_deps)
-                        deps_actuales = new_deps
-                        st.session_state["versions"][-1]["dependencies"] = deps_actuales
-                        log_placeholder.info("Dependencias refinadas (BOTH).")
-                    except Exception as e:
-                        logs_accum += f"Error al refinar dependencias: {e}\n"
-                        log_placeholder.error(f"Error al refinar dependencias: {e}")
-                        break
-                    try:
-                        new_code = refine_code(codigo_actual, outputs, model_name=selected_model)
-                        new_code = clean_code(new_code)
-                        st.session_state["version_counter"] += 1
-                        version_label = get_current_version_label()
-                        st.session_state["versions"].append({
-                            "label": version_label,
-                            "code": new_code,
-                            "dependencies": deps_actuales,
-                            "logs": "",
-                            "stdout": "",
-                            "stderr": "",
-                            "files": {}
-                        })
-                        codigo_actual = new_code
-                        log_placeholder.info(f"Código refinado (BOTH): {version_label}")
-                    except Exception as e:
-                        logs_accum += f"Error al refinar código: {e}\n"
-                        log_placeholder.error(f"Error al refinar código: {e}")
-                        break
-            else:
-                logs_accum += "Estado de validación desconocido.\n"
-                log_placeholder.error("Estado de validación desconocido.")
-                break
-
             if intento == max_attempts:
-                logs_accum += "Alcanzado el número máximo de intentos.\n"
-                log_placeholder.warning("Alcanzado el número máximo de intentos.")
+                logs_accum += "Se alcanzó el número máximo de intentos.\n"
+                update_status("Máximo de intentos alcanzado.")
 
         st.session_state["log_history"] = logs_accum
 
-# =========================================
-# ============= MOSTRAR RESULTADOS =========
-# =========================================
+# =============================================================================
+# ====================== MOSTRAR RESULTADOS ===================================
+# =============================================================================
 
 if st.session_state.get("generated", False):
-    # Siempre se muestra la última versión generada
     latest_version_data = st.session_state["versions"][-1]
 
     col_left, col_right = st.columns([1, 2], gap="medium")
 
-    # -- Columna Izquierda: Dependencias y Logs --
     with col_left:
         st.subheader("Dependencias")
-        deps_text = latest_version_data["dependencies"].strip() if latest_version_data["dependencies"].strip() else "Sin dependencias"
-        st.text_area("Listado de dependencias", deps_text, height=150)
+        deps_text = latest_version_data["dependencies"].strip() or "Sin dependencias"
+        st.text_area("Lista de dependencias", deps_text, height=150)
 
         st.subheader("Logs de Ejecución")
         st.text_area("Logs", st.session_state["log_history"], height=300)
 
-    # -- Columna Derecha: Código --
+        st.subheader("Archivos Generados")
+        if latest_version_data["files"]:
+            for fname, fcontent in latest_version_data["files"].items():
+                icon = get_file_icon(fname)
+                st.write(f"{icon} {fname}")
+                st.download_button(
+                    label="Descargar",
+                    data=fcontent,
+                    file_name=fname
+                )
+        else:
+            st.info("No se generaron archivos.")
+
     with col_right:
         st.subheader("Código Generado")
         st.code(latest_version_data["code"], language="python")
 
-    # Caja para mostrar la lista de archivos generados
-    if latest_version_data["files"]:
-        st.markdown("### Archivos Generados")
-        with st.expander("Ver archivos generados"):
-            for fname, fcontent in latest_version_data["files"].items():
-                st.write(f"- {fname}")
-                st.download_button(
-                    label=f"Descargar {fname}",
-                    data=fcontent,
-                    file_name=fname
-                )
-                preview = format_generated_file(fname, fcontent)
-                st.markdown(preview, unsafe_allow_html=True)
+    if st.session_state["last_status"] == "OK":
+        st.markdown("---")
+        st.markdown("### Reporte de Resultados (Markdown)")
+        # Envolver el Markdown en un div con ancho máximo para que sea más bonito
+        st.markdown(f'<div style="max-width: 800px; margin: auto;">{md_report}</div>', unsafe_allow_html=True)
 
-    # ======================================
-    # ============ MEJORAS ADICIONALES =====
-    # ======================================
+    # Mejoras adicionales
     if st.session_state["last_status"] == "OK":
         st.markdown("---")
         st.markdown("### Mejoras Adicionales")
         improvement_instructions = st.text_area(
             "Instrucciones de mejora:",
-            placeholder="Ejemplo: Optimiza la eficiencia, agrega manejo de excepciones, etc."
+            placeholder="Ejemplo: Optimizar eficiencia y asegurar generación de imágenes."
         )
-        if st.button("Aplicar Iteraciones de Mejora"):
+        if st.button("Aplicar Mejora Adicional"):
             if improvement_instructions.strip():
                 current_code = latest_version_data["code"]
-                current_deps = latest_version_data["dependencies"]
-                for i in range(improvement_iterations):
-                    st.session_state["version_counter"] += 1
-                    version_label = get_current_version_label()
-                    with st.spinner(f"Generando mejora {version_label}..."):
-                        try:
-                            # Generar código mejorado
-                            improved_code = improve_code(current_code, improvement_instructions, model_name=selected_model)
-                            improved_code = clean_code(improved_code)
-                            
-                            if improved_code.strip() == current_code.strip():
-                                st.info(f"No se detectaron cambios en la iteración {version_label}. El código se considera perfecto.")
-                                st.session_state["versions"].append({
-                                    "label": version_label,
-                                    "code": current_code,
-                                    "dependencies": current_deps,
-                                    "logs": "Sin cambios en la iteración de mejora.",
-                                    "stdout": "",
-                                    "stderr": "",
-                                    "files": {}
-                                })
-                                break
-                            else:
-                                current_code = improved_code
-                                # Obtener las nuevas dependencias para el código mejorado
-                                improved_deps = get_dependencies(current_code, model_name=selected_model)
-                                improved_deps = clean_code(improved_deps)
-                                current_deps = improved_deps
-
-                                # Ejecutar el código mejorado en Docker y actualizar resultados
-                                outputs = execute_code_in_docker(current_code, st.session_state["input_files"], current_deps)
-                                
-                                st.session_state["versions"].append({
-                                    "label": version_label,
-                                    "code": current_code,
-                                    "dependencies": current_deps,
-                                    "logs": "",
-                                    "stdout": outputs.get("stdout", ""),
-                                    "stderr": outputs.get("stderr", ""),
-                                    "files": outputs.get("files", {})
-                                })
-                                st.success(f"Iteración {version_label} completada.")
-                        except Exception as e:
-                            st.error(f"Error en la iteración {version_label}: {e}")
-                            break
-                # Forzar la actualización de la UI tras las mejoras
-                st.experimental_rerun()
+                with st.spinner("Aplicando mejora adicional..."):
+                    try:
+                        improved_code = improve_code(current_code, improvement_instructions, model_name=selected_model)
+                        improved_code = clean_code(improved_code)
+                        if improved_code.strip() == current_code.strip():
+                            update_status("No se detectaron cambios en la mejora adicional.")
+                        else:
+                            current_code = improved_code
+                            improved_deps = get_dependencies(current_code, model_name=selected_model)
+                            outputs = execute_code_in_docker(current_code, st.session_state["input_files"], improved_deps)
+                            st.session_state["version_counter"] += 1
+                            version_label = get_current_version_label()
+                            st.session_state["versions"].append({
+                                "label": version_label,
+                                "code": current_code,
+                                "dependencies": improved_deps,
+                                "logs": "",
+                                "stdout": outputs.get("stdout", ""),
+                                "stderr": outputs.get("stderr", ""),
+                                "files": outputs.get("files", {})
+                            })
+                            update_status("Mejora adicional aplicada exitosamente.")
+                    except Exception as e:
+                        st.error(f"Error en mejora adicional: {e}")
             else:
-                st.info("Por favor, ingresa instrucciones de mejora antes de aplicar las iteraciones.")
+                st.error("Ingresa instrucciones de mejora antes de aplicar.")
 
-    else:
-        st.info("No se permiten mejoras adicionales porque la ejecución todavía no es OK o se alcanzó el número máximo de intentos.")
-
-    # Botón para reiniciar y comenzar un nuevo prompt
     if st.button("Nuevo Prompt"):
         keys_to_keep = ["docker_initialized"]
         for key in list(st.session_state.keys()):
