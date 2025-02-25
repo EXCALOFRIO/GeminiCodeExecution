@@ -542,7 +542,7 @@ if st.session_state.get("generated", False) and st.session_state.get("process_co
                 dependencies = get_dependencies(new_code, model_name=selected_model)
                 dependencies = clean_code(dependencies)
 
-                max_attempts = 5
+                max_attempts = 10
                 attempt = 1
                 success = False
                 error_history = []
