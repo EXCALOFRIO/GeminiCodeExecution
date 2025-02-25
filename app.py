@@ -80,14 +80,14 @@ nivel_profundidad = st.sidebar.radio(
 
 if nivel_profundidad == "Poca":
     selected_model = "gemini-2.0-flash-lite-001"
-    cot_iterations = 0
-    revision_iterations = 0
-elif nivel_profundidad == "Normal":
-    selected_model = "gemini-2.0-flash-exp"
     cot_iterations = 2
     revision_iterations = 2
+elif nivel_profundidad == "Normal":
+    selected_model = "gemini-2.0-flash-exp"
+    cot_iterations = 3
+    revision_iterations = 3
 else:  # Extremo
-    selected_model = "gemini-2.0-pro-exp-02-05"
+    selected_model = "gemini-2.0-flash-thinking-exp-01-21"
     cot_iterations = 3
     revision_iterations = 3
 
