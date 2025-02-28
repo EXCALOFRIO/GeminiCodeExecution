@@ -2,117 +2,127 @@ import docker
 import tempfile
 import os
 import hashlib
-import sys
+import requests
+
+BASE_IMAGE_NAME = "python_executor:latest"
+BASE_IMAGE_BUILT = False
 
 def initialize_docker_image():
-    """Inicializa la imagen base de Docker."""
-    client = docker.from_env()  # Corrección: usar from_env()
-    base_image_name = "python_executor:latest"
+    """Construye la imagen base si no existe."""
+    global BASE_IMAGE_BUILT
+    client = docker.DockerClient()
+
+    if BASE_IMAGE_BUILT:
+        return "Imagen Docker base ya existente (cached)."
+
     try:
-        client.images.get(base_image_name)
-        print("[INFO] Imagen Docker base ya existe.")
+        client.images.get(BASE_IMAGE_NAME)
+        BASE_IMAGE_BUILT = True
         return "Imagen Docker base ya existente."
     except docker.errors.ImageNotFound:
-        print("[BUILD] Construyendo imagen base...")
         try:
-            client.images.build(path="./executor", tag=base_image_name)
-            return "Imagen base construida."
+            print("Construyendo imagen Docker base...")
+            image, logs = client.images.build(path="./executor", tag=BASE_IMAGE_NAME)
+            for item in logs:
+                print(item)
+            BASE_IMAGE_BUILT = True
+            return "Imagen Docker base construida."
         except Exception as e:
-            return f"Error al construir imagen base: {e}"
-
-def prebuild_common_image():
-    """Pre-construye una imagen con dependencias comunes para acelerar ejecuciones."""
-    client = docker.from_env()  # Corrección: usar from_env()
-    common_image_name = "python_executor_common:latest"
-    try:
-        client.images.get(common_image_name)
-        print("[INFO] Imagen con dependencias comunes ya existe.")
-    except docker.errors.ImageNotFound:
-        common_deps = "pandas\nnumpy\nmatplotlib"
-        with tempfile.TemporaryDirectory() as tmpdir:
-            dockerfile = f"""
-            FROM python_executor:latest
-            WORKDIR /app
-            COPY requirements.txt .
-            RUN pip install -r requirements.txt
-            """
-            with open(os.path.join(tmpdir, "Dockerfile"), "w") as f:
-                f.write(dockerfile.strip())
-            with open(os.path.join(tmpdir, "requirements.txt"), "w") as f:
-                f.write(common_deps)
-            print("[BUILD] Construyendo imagen con dependencias comunes...")
-            client.images.build(path=tmpdir, tag=common_image_name)
+            return f"Error al construir imagen: {e}"
 
 def get_or_create_cached_image(dependencies: str) -> str:
-    """Crea o reutiliza una imagen Docker basada en las dependencias."""
-    client = docker.from_env()  # Corrección: usar from_env()
-    base_image_name = "python_executor_common:latest" if dependencies.strip() else "python_executor:latest"
+    """Reutiliza o crea una imagen con dependencias específicas."""
     if not dependencies.strip():
-        return base_image_name
+        print("No se especificaron dependencias, usando imagen base.")
+        return BASE_IMAGE_NAME
 
-    dep_hash = hashlib.sha256(dependencies.encode("utf-8")).hexdigest()[:12]
+    # Limpiar y validar dependencias
+    dep_lines = [line.strip() for line in dependencies.split('\n') if line.strip()]
+    if not dep_lines:
+        print("Advertencia: dependencies está vacío después de limpiar, usando imagen base.")
+        return BASE_IMAGE_NAME
+    cleaned_dependencies = '\n'.join(dep_lines)
+
+    dep_hash = hashlib.sha256(cleaned_dependencies.encode("utf-8")).hexdigest()[:12]
     cached_image_name = f"python_executor_cache:{dep_hash}"
+    client = docker.DockerClient()
 
     try:
         client.images.get(cached_image_name)
-        print(f"[CACHE] Usando imagen cacheada: {cached_image_name}")
+        print(f"Imagen encontrada: {cached_image_name}")
         return cached_image_name
     except docker.errors.ImageNotFound:
         with tempfile.TemporaryDirectory() as tmpdir:
-            dockerfile = f"""
-            FROM {base_image_name}
+            dockerfile_content = f"""
+            FROM {BASE_IMAGE_NAME}
             WORKDIR /app
             COPY requirements.txt .
-            RUN pip install -r requirements.txt
+            RUN pip install --no-cache-dir -r requirements.txt
             """
             with open(os.path.join(tmpdir, "Dockerfile"), "w") as f:
-                f.write(dockerfile.strip())
+                f.write(dockerfile_content.strip())
             with open(os.path.join(tmpdir, "requirements.txt"), "w") as f:
-                f.write(dependencies)
-            print(f"[BUILD] Construyendo imagen: {cached_image_name}")
+                f.write(cleaned_dependencies)
+            print(f"Contenido de requirements.txt:\n{cleaned_dependencies}")
             try:
-                client.images.build(path=tmpdir, tag=cached_image_name)
+                print(f"Construyendo imagen para dependencias: {cleaned_dependencies}")
+                image, logs = client.images.build(path=tmpdir, tag=cached_image_name)
+                for item in logs:
+                    print(item)
                 return cached_image_name
             except Exception as e:
-                print(f"[ERROR] Falló construcción: {e}")
-                return base_image_name
+                print(f"Error al construir imagen: {e}")
+                print("Logs de construcción detallados no disponibles en esta excepción.")
+                return BASE_IMAGE_NAME
 
 def execute_code_in_docker(code: str, input_files: dict, dependencies: str = None) -> dict:
-    """Ejecuta el código en un contenedor Docker optimizado."""
-    client = docker.from_env()  # Corrección: usar from_env()
-    custom_image = get_or_create_cached_image(dependencies)
-    
+    """Ejecuta el código en un contenedor Docker."""
+    client = docker.DockerClient()
+    image = get_or_create_cached_image(dependencies) if dependencies else BASE_IMAGE_NAME
+
     with tempfile.TemporaryDirectory() as temp_dir:
         script_path = os.path.join(temp_dir, "script.py")
         with open(script_path, "w", encoding="utf-8") as f:
             f.write(code)
+
         for filename, content in input_files.items():
             with open(os.path.join(temp_dir, filename), "wb") as f:
                 f.write(content)
+
+        container = None
         try:
             container = client.containers.run(
-                image=custom_image,
-                command="python /app/script.py",
-                volumes={temp_dir: {'bind': '/app', 'mode': 'rw'}},
+                image=image,
+                command=["/bin/bash", "-c", "python script.py 2> error.log"],
+                volumes={temp_dir: {"bind": "/app", "mode": "rw"}},
                 working_dir="/app",
-                detach=True,
-                stdout=True,
-                stderr=True
+                detach=True
             )
-            container.wait()
-            stdout = container.logs(stdout=True, stderr=False).decode('utf-8', errors='replace')
-            stderr = container.logs(stdout=False, stderr=True).decode('utf-8', errors='replace')
-            container.remove()
-        except Exception as e:
-            return {"stdout": "", "stderr": f"Error ejecutando contenedor: {e}", "all_files": {}, "generated_files": {}}
+            try:
+                container.wait(timeout=60)
+            except requests.exceptions.ReadTimeout:
+                container.stop()
+                return {"stdout": "", "stderr": "Tiempo excedido (60s)", "files": {}}
 
-        all_files = {}
+            stdout = container.logs().decode("utf-8", errors="replace")
+            stderr = ""
+            error_log_path = os.path.join(temp_dir, "error.log")
+            if os.path.exists(error_log_path):
+                with open(error_log_path, "r", encoding="utf-8", errors="ignore") as f:
+                    stderr = f.read()
+
+        except Exception as e:
+            return {"stdout": "", "stderr": str(e), "files": {}}
+        finally:
+            if container:
+                container.remove()
+
+        generated_files = {}
         for root, _, files in os.walk(temp_dir):
             for file in files:
-                file_path = os.path.join(root, file)
-                rel_path = os.path.relpath(file_path, temp_dir)
-                with open(file_path, "rb") as f:
-                    all_files[rel_path] = f.read()
+                if file in ["script.py", "error.log"] or file in input_files:
+                    continue
+                with open(os.path.join(root, file), "rb") as f:
+                    generated_files[file] = f.read()
 
-        generated_files = {k: v for k, v in all_files.items() if k != "script.py" and k not in input_files}
-        return {"stdout": stdout, "stderr": stderr, "all_files": all_files, "generated_files": generated_files}
+        return {"stdout": stdout, "stderr": stderr, "files": generated_files}
