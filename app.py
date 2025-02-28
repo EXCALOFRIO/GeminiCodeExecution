@@ -1,13 +1,10 @@
 import streamlit as st
-import os
 import io
 import zipfile
-import time
 
 from gemini_client import configure_gemini, improve_prompt, generate_code, analyze_execution_result, generate_fix, generate_report
 from docker_executor import initialize_docker_image, execute_code_in_docker
 from code_formatter import clean_code
-from dependency_generator import generate_dependencies
 
 # Configuración de la página Streamlit
 st.set_page_config(page_title="Generador de Código Python", layout="wide")
