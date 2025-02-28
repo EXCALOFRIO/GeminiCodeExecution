@@ -8,13 +8,14 @@ BASE_IMAGE_NAME = "python_executor:latest"
 BASE_IMAGE_BUILT = False
 
 def initialize_docker_image():
-    """Construye la imagen base si no existe."""
+    """
+    Construye la imagen base si no existe.
+    Se asume que en la carpeta './executor' existe un Dockerfile base.
+    """
     global BASE_IMAGE_BUILT
     client = docker.DockerClient()
-
     if BASE_IMAGE_BUILT:
         return "Imagen Docker base ya existente (cached)."
-
     try:
         client.images.get(BASE_IMAGE_NAME)
         BASE_IMAGE_BUILT = True
@@ -31,7 +32,10 @@ def initialize_docker_image():
             return f"Error al construir imagen: {e}"
 
 def get_or_create_cached_image(dependencies: str) -> str:
-    """Reutiliza o crea una imagen con dependencias específicas."""
+    """
+    Reutiliza o crea una imagen con dependencias específicas.
+    Se genera un archivo requirements.txt a partir de la lista de dependencias.
+    """
     if not dependencies.strip():
         print("No se especificaron dependencias, usando imagen base.")
         return BASE_IMAGE_NAME
@@ -43,6 +47,7 @@ def get_or_create_cached_image(dependencies: str) -> str:
         return BASE_IMAGE_NAME
     cleaned_dependencies = '\n'.join(dep_lines)
 
+    # Generar un hash basado en las dependencias para identificar la imagen cacheada
     dep_hash = hashlib.sha256(cleaned_dependencies.encode("utf-8")).hexdigest()[:12]
     cached_image_name = f"python_executor_cache:{dep_hash}"
     client = docker.DockerClient()
@@ -59,32 +64,37 @@ def get_or_create_cached_image(dependencies: str) -> str:
             COPY requirements.txt .
             RUN pip install --no-cache-dir -r requirements.txt
             """
-            with open(os.path.join(tmpdir, "Dockerfile"), "w") as f:
+            dockerfile_path = os.path.join(tmpdir, "Dockerfile")
+            with open(dockerfile_path, "w") as f:
                 f.write(dockerfile_content.strip())
-            with open(os.path.join(tmpdir, "requirements.txt"), "w") as f:
+            req_path = os.path.join(tmpdir, "requirements.txt")
+            with open(req_path, "w") as f:
                 f.write(cleaned_dependencies)
             print(f"Contenido de requirements.txt:\n{cleaned_dependencies}")
             try:
-                print(f"Construyendo imagen para dependencias: {cleaned_dependencies}")
+                print(f"Construyendo imagen para dependencias: {cached_image_name}")
                 image, logs = client.images.build(path=tmpdir, tag=cached_image_name)
                 for item in logs:
                     print(item)
                 return cached_image_name
             except Exception as e:
                 print(f"Error al construir imagen: {e}")
-                print("Logs de construcción detallados no disponibles en esta excepción.")
                 return BASE_IMAGE_NAME
 
 def execute_code_in_docker(code: str, input_files: dict, dependencies: str = None) -> dict:
-    """Ejecuta el código en un contenedor Docker."""
+    """
+    Ejecuta el código en un contenedor Docker utilizando la imagen base o una imagen cacheada con las dependencias.
+    """
     client = docker.DockerClient()
     image = get_or_create_cached_image(dependencies) if dependencies else BASE_IMAGE_NAME
 
     with tempfile.TemporaryDirectory() as temp_dir:
+        # Guardar el script principal
         script_path = os.path.join(temp_dir, "script.py")
         with open(script_path, "w", encoding="utf-8") as f:
             f.write(code)
 
+        # Guardar archivos adicionales necesarios
         for filename, content in input_files.items():
             with open(os.path.join(temp_dir, filename), "wb") as f:
                 f.write(content)
@@ -117,12 +127,14 @@ def execute_code_in_docker(code: str, input_files: dict, dependencies: str = Non
             if container:
                 container.remove()
 
+        # Recopilar archivos generados que no sean el script, el log de errores ni los archivos de entrada
         generated_files = {}
         for root, _, files in os.walk(temp_dir):
             for file in files:
                 if file in ["script.py", "error.log"] or file in input_files:
                     continue
-                with open(os.path.join(root, file), "rb") as f:
+                file_path = os.path.join(root, file)
+                with open(file_path, "rb") as f:
                     generated_files[file] = f.read()
 
         return {"stdout": stdout, "stderr": stderr, "files": generated_files}
