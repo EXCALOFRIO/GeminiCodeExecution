@@ -6,12 +6,8 @@ import time
 import pandas as pd
 
 from gemini_client import (
-    configure_gemini,
-    improve_prompt,
     generate_code,
-    generate_code_modification,
     analyze_execution_result,
-    generate_fix,
     generate_report
 )
 from docker_executor import initialize_docker_image, execute_code_in_docker, clean_unused_images, clean_unused_containers
@@ -41,9 +37,7 @@ st.set_page_config(page_title="Generador de Código Python", layout="wide")
 
 # Verificación inicial de Docker
 docker_init_message = init_docker()
-if "Error" not in docker_init_message:
-    pass
-else:
+if "Error" in docker_init_message:
     st.error(docker_init_message, icon="❌")
     st.stop()
 
@@ -82,8 +76,8 @@ st.markdown("""
     box-shadow: 0px 2px 8px rgba(0,0,0,0.3);
 }
 .file-container {
-    width: 70%; /* Ancho del 70% */
-    margin: auto; /* Centrado horizontal */
+    width: 70%;
+    margin: auto;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -101,8 +95,8 @@ if "generated_files" not in st.session_state:
     st.session_state.generated_files = {}
 if "results_available" not in st.session_state:
     st.session_state.results_available = False
-if "cleaned_code" not in st.session_state:
-    st.session_state.cleaned_code = ""
+if "formatted_report" not in st.session_state:
+    st.session_state.formatted_report = ""
 if "execution_result" not in st.session_state:
     st.session_state.execution_result = {}
 if "preview_active" not in st.session_state:
@@ -111,18 +105,13 @@ if "preview_file" not in st.session_state:
     st.session_state.preview_file = None
 if "preview_content" not in st.session_state:
     st.session_state.preview_content = None
-if "current_code" not in st.session_state:
-    st.session_state.current_code = ""
-if "current_dependencies" not in st.session_state:
-    st.session_state.current_dependencies = ""
-if "formatted_report" not in st.session_state:
-    st.session_state.formatted_report = ""
 if "all_files" not in st.session_state:
     st.session_state.all_files = {}
 
 # ----------------------------------------------------------------
 # 5. FUNCIONES AUXILIARES
 # ----------------------------------------------------------------
+
 def show_file_preview(file_name, file_content):
     st.session_state.preview_file = file_name
     st.session_state.preview_content = file_content
@@ -197,16 +186,28 @@ def procesar_reporte(report, files_dict):
             formatted_lines.append(line)
     return '\n'.join(formatted_lines)
 
+def clean_markdown(text: str) -> str:
+    """
+    Limpia el markdown eliminando caracteres innecesarios y formateando.
+    """
+    # Eliminar líneas en blanco adicionales
+    lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]  # Eliminar líneas vacías
+    return "\n".join(lines)
+
+
 # ----------------------------------------------------------------
 # 6. FUNCIÓN PRINCIPAL PARA GENERAR Y EJECUTAR
 # ----------------------------------------------------------------
 def generate_and_execute():
+    # Reiniciamos el estado para que cada ejecución parta desde 0
     st.session_state.results_available = False
     st.session_state.generated_files = {}
     st.session_state.formatted_report = ""
     st.session_state.execution_result = {}
     st.session_state.attempts = 0
     st.session_state.execution_history = []
+    st.session_state.all_files = {}
 
     prompt = st.session_state["user_prompt"]
     uploaded_files = st.session_state.get("user_files", [])
@@ -215,11 +216,6 @@ def generate_and_execute():
     if uploaded_files:
         for file in uploaded_files:
             all_files[file.name] = file.read()
-    if st.session_state.generated_files:
-        all_files.update(st.session_state.generated_files)
-    if st.session_state.current_code:
-        all_files["script.py"] = st.session_state.current_code
-
     st.session_state.all_files = all_files
     input_files = all_files
 
@@ -227,24 +223,10 @@ def generate_and_execute():
     with st.spinner("Preparando el entorno..."):
         time.sleep(0.5)
 
-    # Optimización del prompt
-    status_area.info("Optimizando tu solicitud para obtener los mejores resultados...", icon="🪄")
-    improved_response = improve_prompt(prompt, input_files)
+    # Generación inicial del código sin aplicar mejoras adicionales
+    status_area.info("Generando el código Python y sus dependencias desde cero...", icon="🛠️")
+    response = generate_code(prompt, input_files)
 
-    # Generación o modificación del código
-    if not st.session_state.current_code:
-        status_area.info("Generando el código Python y sus dependencias desde cero...", icon="🛠️")
-        response = generate_code(improved_response["code"], input_files)
-    else:
-        status_area.info("Modificando el código existente según tu nueva solicitud...", icon="🔄")
-        response = generate_code_modification(
-            st.session_state.current_code,
-            st.session_state.current_dependencies,
-            improved_response["code"],
-            input_files
-        )
-
-    # Validación del código y dependencias generados
     generated_code = response.get("code", "")
     dependencies = response.get("dependencies", "")
     if not generated_code.strip():
@@ -252,13 +234,13 @@ def generate_and_execute():
         return
     if not dependencies.strip():
         st.warning("No se generaron dependencias nuevas. Usando dependencias actuales.")
-        dependencies = st.session_state.current_dependencies
+        dependencies = ""
     cleaned_code = clean_code(generated_code)
 
-    # Bucle de ejecución con intentos
-    while st.session_state.attempts < 5:
+    # Aumentamos el número de intentos a 8; en cada intento se vuelve a generar el código desde cero si ocurre error
+    while st.session_state.attempts < 8:
         attempt_number = st.session_state.attempts + 1
-        status_area.info(f"Intento {attempt_number}/5: Ejecutando el código en un entorno Docker aislado...", icon="🚀")
+        status_area.info(f"Intento {attempt_number}/8: Ejecutando el código en un entorno Docker aislado...", icon="🚀")
 
         execution_result = execute_code_in_docker(cleaned_code, input_files, dependencies)
         analysis = analyze_execution_result(execution_result)
@@ -276,8 +258,6 @@ def generate_and_execute():
             st.session_state.generated_files = execution_result["files"]
             st.session_state.cleaned_code = cleaned_code
             st.session_state.execution_result = execution_result
-            st.session_state.current_code = cleaned_code  # Actualizar el código actual
-            st.session_state.current_dependencies = dependencies  # Actualizar las dependencias
 
             st.session_state.all_files.update({"script.py": cleaned_code})
             st.session_state.all_files.update(st.session_state.generated_files)
@@ -288,26 +268,27 @@ def generate_and_execute():
                 st.session_state.execution_result.get("stdout", ""),
                 st.session_state.generated_files
             )
-            st.session_state.formatted_report = procesar_reporte(report, st.session_state.generated_files)
+            formatted_report = procesar_reporte(report, st.session_state.generated_files)
+            st.session_state.formatted_report = clean_markdown(formatted_report)  # Limpiar el markdown del reporte
             break
         else:
             error_msg = analysis.get("error_message", "Error inesperado.")
-            status_area.error(f"Intento {attempt_number}/5 fallido: {error_msg}", icon="❌")
+            status_area.error(f"Intento {attempt_number}/8 fallido: {error_msg}", icon="❌")
             st.session_state.attempts += 1
-            if st.session_state.attempts >= 5:
+            if st.session_state.attempts >= 8:
                 status_area.error("Límite de intentos alcanzado. No se pudo generar el código sin errores.", icon="🚫")
                 break
-            status_area.info("Analizando el error y aplicando correcciones...", icon="🔍")
-            fix = generate_fix(
-                error_type=analysis.get("error_type", ""),
-                error_message=analysis.get("error_message", ""),
-                code=cleaned_code,
-                dependencies=dependencies,
-                history=st.session_state.execution_history
-            )
-            cleaned_code = fix.get("code", cleaned_code)
-            dependencies = fix.get("dependencies", dependencies)
-            st.session_state.current_dependencies = dependencies  # Actualizar dependencias incluso en caso de error
+            status_area.info("Reintentando la generación del código desde cero...", icon="🔄")
+            response = generate_code(prompt, input_files)
+            generated_code = response.get("code", "")
+            dependencies = response.get("dependencies", "")
+            if not generated_code.strip():
+                status_area.error("No se generó código válido en el reintento. Revisa tu solicitud.", icon="❌")
+                break
+            if not dependencies.strip():
+                st.warning("No se generaron dependencias nuevas en el reintento. Usando dependencias actuales.")
+                dependencies = ""
+            cleaned_code = clean_code(generated_code)
 
 # ----------------------------------------------------------------
 # 7. INTERFAZ PRINCIPAL

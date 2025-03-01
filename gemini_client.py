@@ -17,29 +17,57 @@ class FixResponse(BaseModel):
     code: str
     dependencies: str
 
-client = None
-MODEL_NAME = "gemini-2.0-flash-001"  # Nombre del modelo
-
-def configure_gemini():
+# Función para cargar las API keys desde .env
+def load_api_keys():
     load_dotenv()
-    keys = [os.environ.get(f"GEMINI_API_KEY{i}") for i in range(1, 7) if os.environ.get(f"GEMINI_API_KEY{i}")]
+    keys = [
+        os.environ.get(f"GEMINI_API_KEY{i}")
+        for i in range(1, 7)
+        if os.environ.get(f"GEMINI_API_KEY{i}")
+    ]
     if not keys:
         raise ValueError("No se encontraron claves API en .env")
-    api_key = random.choice(keys)
-    global client
-    client = genai.Client(api_key=api_key)
+    return keys
 
-def ensure_client():
-    global client
-    if client is None:
-        configure_gemini()
+# Función que retorna un cliente nuevo con una API key distinta, excluyendo las que hayan fallado
+def get_client(exclude_keys: set | None = None) -> tuple[genai.Client, str]:
+    if exclude_keys is None:
+        exclude_keys = set()
+    keys = load_api_keys()
+    available_keys = [k for k in keys if k not in exclude_keys]
+    if not available_keys:
+        raise ValueError("No hay API keys disponibles (todas fueron descartadas por errores).")
+    api_key = random.choice(available_keys)
+    return genai.Client(api_key=api_key), api_key
 
+# Función auxiliar que realiza la petición y, en caso de error 429, rota la API key
+def safe_generate_content(model: str, contents: str, config: dict, retries: int = 3):
+    from google.genai.errors import ClientError  # Importar el error del SDK
+    used_keys = set()
+    for attempt in range(retries):
+        client, current_key = get_client(exclude_keys=used_keys)
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+            return response
+        except Exception as e:
+            # Verificar si el error es de tipo 429 (RESOURCE_EXHAUSTED)
+            if hasattr(e, 'status_code') and e.status_code == 429:
+                used_keys.add(current_key)
+                # Se intenta nuevamente con otra API key
+                continue
+            else:
+                raise e
+    raise Exception("Todos los API keys están agotados o retornaron error 429.")
+
+# Función para mejorar el prompt
 def improve_prompt(prompt: str, files: dict) -> dict:
-    ensure_client()
     file_info = "\n".join([
-        f"Archivo: {name}\nContenido (primeros 500 caracteres): " + (
-            content.decode('utf-8', errors='ignore')[:500] if isinstance(content, bytes) else content[:500]
-        )
+        f"Archivo: {name}\nContenido (primeros 500 caracteres): " +
+        (content.decode('utf-8', errors='ignore')[:500] if isinstance(content, bytes) else content[:500])
         for name, content in files.items()
     ])
     contents = (
@@ -48,9 +76,9 @@ def improve_prompt(prompt: str, files: dict) -> dict:
         "Detalles adicionales: El archivo CSV tiene columnas 'fecha' y 'valor'.\n\n"
         f"Prompt original: {prompt}\nArchivos:\n{file_info}"
     )
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=f"Mejora este prompt para que sea lo más claro y detallado posible, incluyendo ejemplos si es necesario. Also list the libraries that might be needed as dependencies:\n{contents}",
+    response = safe_generate_content(
+        model="gemini-2.0-flash-lite-001",
+        contents=("Mejora este prompt para que sea lo más claro y detallado posible, incluyendo ejemplos si es necesario. Also list the libraries that might be needed as dependencies:\n" + contents),
         config={
             "response_mime_type": "application/json",
             "response_schema": CodeResponse,
@@ -61,17 +89,17 @@ def improve_prompt(prompt: str, files: dict) -> dict:
     except Exception as e:
         return {"code": "", "dependencies": ""}
 
+# Función para generar código a partir del prompt mejorado
 def generate_code(improved_prompt: str, files: dict) -> dict:
-    ensure_client()
     file_info = "\n".join([f"Archivo: {name}" for name in files.keys()])
     contents = (
         "Ejemplo:\n"
         "Si el prompt dice 'Generar un gráfico a partir de datos CSV', el código debe importar 'pandas' y 'matplotlib' y contener un bloque principal que realice la lectura y el gráfico.\n\n"
         f"Tarea: {improved_prompt}\nArchivos disponibles: {file_info}"
     )
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=f"Genera código Python y una lista de dependencias en formato requirements.txt (una dependencia por línea, sin texto adicional) para resolver la siguiente tarea:\n{contents}",
+    response = safe_generate_content(
+        model="gemini-2.0-flash-lite-001",
+        contents=("Genera código Python y una lista de dependencias en formato requirements.txt (una dependencia por línea, sin texto adicional) para resolver la siguiente tarea:\n" + contents),
         config={
             "response_mime_type": "application/json",
             "response_schema": CodeResponse,
@@ -79,48 +107,8 @@ def generate_code(improved_prompt: str, files: dict) -> dict:
     )
     return response.parsed.dict()
 
-def generate_code_modification(current_code: str, current_dependencies: str, new_prompt: str, files: dict) -> dict:
-    ensure_client()
-    file_info = "\n".join([f"Archivo: {name}" for name in files.keys()])
-    contents = (
-        f"Código actual:\n```python\n{current_code}\n```\n"
-        f"Dependencias actuales:\n{current_dependencies}\n"
-        f"Nuevo requerimiento: {new_prompt}\n"
-        f"Archivos disponibles: {file_info}\n\n"
-        "Genera una versión modificada del código Python que cumpla con el nuevo requerimiento. "
-        "Además, proporciona una lista actualizada de dependencias en formato requirements.txt "
-        "(una dependencia por línea, como 'pandas', 'matplotlib', sin explicaciones ni texto adicional). "
-        "Asegúrate de incluir todas las dependencias necesarias para el código modificado, "
-        "manteniendo las dependencias actuales que aún sean requeridas y agregando nuevas si es necesario."
-    )
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=contents,
-        config={
-            "response_mime_type": "application/json",
-            "response_schema": CodeResponse,
-        },
-    )
-    print("Respuesta cruda de la API:", response.text)  # Depuración
-    try:
-        parsed_response = response.parsed.dict()
-        code = parsed_response.get("code", current_code)
-        dependencies = parsed_response.get("dependencies", "")
-        print("Código generado:", code)  # Depuración
-        print("Dependencias parseadas:", dependencies)  # Depuración
-        if not code.strip():
-            print("Error: El código generado está vacío.")
-            return {"code": current_code, "dependencies": current_dependencies}
-        if not dependencies.strip():
-            print("Advertencia: Las dependencias están vacías. Usando dependencias actuales.")
-            parsed_response["dependencies"] = current_dependencies
-        return parsed_response
-    except Exception as e:
-        print(f"Error al parsear la respuesta: {e}")
-        return {"code": current_code, "dependencies": current_dependencies}
-
+# Función para analizar el resultado de ejecución
 def analyze_execution_result(execution_result: dict) -> dict:
-    ensure_client()
     stdout = execution_result.get("stdout", "")
     stderr = execution_result.get("stderr", "")
     files = execution_result.get("files", {})
@@ -139,8 +127,8 @@ def analyze_execution_result(execution_result: dict) -> dict:
         "Si ocurrió algún error, devuelve ERROR seguido de una breve descripción del problema y su posible causa.\n\n"
         f"Resultado de ejecución: {summary}"
     )
-    response = client.models.generate_content(
-        model=MODEL_NAME,
+    response = safe_generate_content(
+        model="gemini-2.0-flash-lite-001",
         contents=("Analiza el siguiente resultado de ejecución y devuelve 'OK' si fue exitoso o 'ERROR' si hubo problemas, "
                   "junto con una breve descripción del error:\n" + contents),
         config={
@@ -150,9 +138,12 @@ def analyze_execution_result(execution_result: dict) -> dict:
     )
     return response.parsed.dict()
 
+# Función para generar una corrección (fix) en el código en base al historial y al error
 def generate_fix(error_type: str, error_message: str, code: str, dependencies: str, history: list) -> dict:
-    ensure_client()
-    history_text = "\n".join([f"Intento {i+1}: Error: {item.get('error_type', '')} - {item.get('error_message', '')}\nCódigo:\n{item.get('code', '')}\n" for i, item in enumerate(history)])
+    history_text = "\n".join([
+        f"Intento {i+1}: Error: {item.get('error_type', '')} - {item.get('error_message', '')}\nCódigo:\n{item.get('code', '')}\n"
+        for i, item in enumerate(history)
+    ])
     if error_type == "ERROR" and "ImportError" in error_message:
         prompt_fix = (
             "Corrige el problema de dependencias en el código sin modificar el código. "
@@ -181,8 +172,8 @@ def generate_fix(error_type: str, error_message: str, code: str, dependencies: s
             f"Dependencias actuales:\n{dependencies}\n\n"
             "Devuelve un JSON con dos campos: 'code' (el código Python corregido) y 'dependencies' (la lista de dependencias, sin cambios si no es necesario modificarlas)."
         )
-    response = client.models.generate_content(
-        model=MODEL_NAME,
+    response = safe_generate_content(
+        model="gemini-2.0-flash-lite-001",
         contents=prompt_fix,
         config={
             "response_mime_type": "application/json",
@@ -191,8 +182,8 @@ def generate_fix(error_type: str, error_message: str, code: str, dependencies: s
     )
     return response.parsed.dict()
 
+# Función para generar un reporte en Markdown
 def generate_report(problem_description: str, code: str, stdout: str, files: dict) -> str:
-    ensure_client()
     file_list = "\n".join([f"- {name}" for name in files.keys()]) if files else "No hay archivos generados."
     contents = (
         "Genera un reporte en Markdown que incluya los siguientes puntos:\n"
@@ -205,28 +196,23 @@ def generate_report(problem_description: str, code: str, stdout: str, files: dic
         f"Salida: {stdout}\n"
         f"Archivos generados:\n{file_list}"
     )
-    response = client.models.generate_content(
-        model=MODEL_NAME,
+    response = safe_generate_content(
+        model="gemini-2.0-flash-lite-001",
         contents=contents,
         config={"response_mime_type": "text/plain"},
     )
     return response.text
 
+# Función para validar y corregir el formato de requirements.txt
 def validate_requirements_format(requirements: str) -> str:
-    """
-    Valida y corrige el formato del archivo requirements.txt.
-    Se asegura de que cada dependencia esté en una línea separada y correctamente formateada.
-    Devuelve el contenido corregido en formato requirements.txt (una dependencia por línea, sin texto adicional).
-    """
-    ensure_client()
     prompt = (
         "Corrige y valida el siguiente contenido de un archivo requirements.txt. "
         "Asegúrate de que cada dependencia esté en una línea separada, sin texto adicional ni errores de formato. "
         f"Contenido original:\n{requirements}\n\n"
         "Devuelve un JSON con el campo 'dependencies' que contenga el contenido corregido y validado."
     )
-    response = client.models.generate_content(
-        model=MODEL_NAME,
+    response = safe_generate_content(
+        model="gemini-2.0-flash-lite-001",
         contents=prompt,
         config={
             "response_mime_type": "application/json",
