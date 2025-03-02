@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import io
 import zipfile
@@ -8,7 +9,8 @@ import pandas as pd
 from gemini_client import (
     generate_code,
     analyze_execution_result,
-    generate_report
+    generate_report,
+    configure_gemini  # Asegúrate de importar configure_gemini
 )
 from docker_executor import initialize_docker_image, execute_code_in_docker, clean_unused_images, clean_unused_containers
 from code_formatter import clean_code
@@ -174,17 +176,77 @@ class FileBrowser:
             with col2:
                 st.download_button("⬇️", data=content, file_name=file_name, key=f"dl_{file_name}")
 
-def procesar_reporte(report, files_dict):
-    lines = report.split('\n')
-    formatted_lines = []
-    for line in lines:
-        if line.startswith("- ") and formatted_lines and "Archivos Generados" in formatted_lines[-1]:
-            file_name = line[2:].strip()
-            file_size = len(files_dict.get(file_name, b'')) / 1024
-            formatted_lines.append(f"📄 **{file_name}** ({file_size:.2f} KB)")
+def process_report_content(report: str, files_dict: dict):
+    """
+    Processes the report, identifies file markers like {{filename}},
+    and prepares the report for display, separating text from file content.
+    """
+    parts = []
+    current_text = ""
+    import re
+
+    # Regex to find file markers like {{filename.ext}}
+    file_marker_regex = re.compile(r"\{\{(.+?)\}\}")
+
+    last_end = 0
+    for match in file_marker_regex.finditer(report):
+        file_name = match.group(1)
+        start, end = match.span()
+
+        # Add text before the marker
+        text_chunk = report[last_end:start].strip()
+        if text_chunk:
+            parts.append({"type": "text", "content": text_chunk})
+
+        # Add the file content
+        if file_name in files_dict:
+            parts.append({"type": "file", "name": file_name, "content": files_dict[file_name]})
         else:
-            formatted_lines.append(line)
-    return '\n'.join(formatted_lines)
+            parts.append({"type": "text", "content": f"**Archivo no encontrado:** {file_name}"})
+
+        last_end = end
+
+    # Add any remaining text after the last marker
+    remaining_text = report[last_end:].strip()
+    if remaining_text:
+        parts.append({"type": "text", "content": remaining_text})
+
+    return parts
+
+def display_processed_report(processed_report):
+    """
+    Displays the processed report, handling text and file components appropriately.
+    """
+    for item in processed_report:
+        if item["type"] == "text":
+            st.markdown(item["content"], unsafe_allow_html=True)  # Render markdown text
+        elif item["type"] == "file":
+            file_name = item["name"]
+            file_content = item["content"]
+            file_ext = file_name.split('.')[-1].lower()
+
+            st.subheader(f"Archivo: {file_name}")  # Display file name as subheader
+            if file_ext in ['png', 'jpg', 'jpeg', 'gif']:
+                st.image(file_content, caption=file_name)
+            elif file_ext == 'csv':
+                try:
+                    df = pd.read_csv(io.BytesIO(file_content))
+                    st.dataframe(df)
+                except Exception as e:
+                    st.error(f"Error al mostrar CSV: {e}")
+            elif file_ext == 'py':
+                try:
+                    text_content = file_content.decode('utf-8')
+                    st.code(text_content, language='python')
+                except Exception as e:
+                    st.error(f"Error al mostrar código Python: {e}")
+            else:
+                try:
+                    text_content = file_content.decode('utf-8')
+                    st.text_area("Contenido", text_content, height=300)
+                except:
+                    st.warning(f"No se puede mostrar el contenido del archivo {file_name}.", icon="⚠️")
+
 
 def clean_markdown(text: str) -> str:
     """
@@ -194,7 +256,6 @@ def clean_markdown(text: str) -> str:
     lines = [line.strip() for line in text.splitlines()]
     lines = [line for line in lines if line]  # Eliminar líneas vacías
     return "\n".join(lines)
-
 
 # ----------------------------------------------------------------
 # 6. FUNCIÓN PRINCIPAL PARA GENERAR Y EJECUTAR
@@ -268,8 +329,8 @@ def generate_and_execute():
                 st.session_state.execution_result.get("stdout", ""),
                 st.session_state.generated_files
             )
-            formatted_report = procesar_reporte(report, st.session_state.generated_files)
-            st.session_state.formatted_report = clean_markdown(formatted_report)  # Limpiar el markdown del reporte
+            # formatted_report = procesar_reporte(report, st.session_state.generated_files)
+            st.session_state.formatted_report = report  # clean_markdown(formatted_report)  # Limpiar el markdown del reporte
             break
         else:
             error_msg = analysis.get("error_message", "Error inesperado.")
@@ -321,7 +382,9 @@ if st.session_state.results_available:
     col_report, col_files = st.columns([7, 3])
     with col_report:
         st.subheader("📋 Reporte")
-        st.markdown(f"<div class='report-container'>{st.session_state.formatted_report}</div>", unsafe_allow_html=True)
+        #st.markdown(f"<div class='report-container'>{st.session_state.formatted_report}</div>", unsafe_allow_html=True)
+        processed_report = process_report_content(st.session_state.formatted_report, st.session_state.generated_files)
+        display_processed_report(processed_report)
     with col_files:
         st.subheader("📁 Archivos Generados")
         browser = FileBrowser(st.session_state.generated_files)
