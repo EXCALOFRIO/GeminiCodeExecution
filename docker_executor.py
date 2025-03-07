@@ -4,16 +4,10 @@ import os
 import hashlib
 import requests
 
-#from gemini_client import validate_requirements_format
-
 BASE_IMAGE_NAME = "python_executor:latest"
 BASE_IMAGE_BUILT = False
 
 def initialize_docker_image():
-    """
-    Construye la imagen base si no existe.
-    Se asume que en la carpeta './executor' existe un Dockerfile base.
-    """
     global BASE_IMAGE_BUILT
     if BASE_IMAGE_BUILT:
         return "Imagen Docker base ya existente (cached)."
@@ -43,22 +37,22 @@ def initialize_docker_image():
             return f"Error al construir la imagen Docker: {e}"
 
 def get_or_create_cached_image(dependencies: str) -> str:
-    """
-    Reutiliza o crea una imagen con dependencias específicas.
-    Genera un archivo requirements.txt a partir de las dependencias.
-    """
     if not dependencies.strip():
         print("No se especificaron dependencias, usando imagen base.")
         return BASE_IMAGE_NAME
 
-    dep_lines = [line.strip() for line in dependencies.split('\n') if line.strip()]
+    # Procesar dependencias para asegurar el formato correcto
+    dep_lines = []
+    for line in dependencies.split('\n'):
+        line = line.strip()
+        if line:
+            # Dividir por comas y limpiar cada entrada
+            deps = [dep.strip() for dep in line.split(',') if dep.strip()]
+            dep_lines.extend(deps)
     if not dep_lines:
         print("Advertencia: dependencies está vacío después de limpiar, usando imagen base.")
         return BASE_IMAGE_NAME
     cleaned_dependencies = '\n'.join(dep_lines)
-    
-    # Validar y corregir el formato de requirements.txt usando Gemini
-    #corrected_dependencies = validate_requirements_format(cleaned_dependencies)
     
     dep_hash = hashlib.sha256(cleaned_dependencies.encode("utf-8")).hexdigest()[:12]
     cached_image_name = f"python_executor_cache:{dep_hash}"
@@ -94,7 +88,6 @@ def get_or_create_cached_image(dependencies: str) -> str:
                 return BASE_IMAGE_NAME
 
 def clean_unused_images():
-    """Elimina todas las imágenes cacheadas etiquetadas como python_executor_cache:*."""
     client = docker.DockerClient()
     try:
         images = client.images.list(filters={"reference": "python_executor_cache:*"})
@@ -106,7 +99,6 @@ def clean_unused_images():
         print(f"Error al limpiar imágenes: {e}")
 
 def clean_unused_containers():
-    """Elimina todos los contenedores creados por la aplicación que ya no están en ejecución."""
     client = docker.DockerClient()
     try:
         containers = client.containers.list(all=True, filters={"status": "exited"})
@@ -162,9 +154,9 @@ def execute_code_in_docker(code: str, input_files: dict, dependencies: str = Non
             return {"stdout": "", "stderr": str(e), "files": {}}
         finally:
             if container:
-                container.remove()
+                container.stop()
+                container.remove(force=True)
 
-        # Recopilar TODOS los archivos del directorio /app (excepto error.log)
         generated_files = {}
         for root, _, files in os.walk(temp_dir):
             for file in files:

@@ -7,7 +7,9 @@ import ast
 import concurrent.futures
 import time
 import os
+import base64  # Para previsualizar PDFs y GIF con HTML embebido
 from typing import Dict, List
+from PIL import Image  # Se utiliza para re-guardar el GIF con loop infinito
 
 from gemini_client import (
     generate_code,
@@ -19,7 +21,7 @@ from gemini_client import (
 from docker_executor import initialize_docker_image, execute_code_in_docker, clean_unused_images, clean_unused_containers
 from code_formatter import clean_code  # Asumo que existe este módulo
 
-# Limpieza inicial
+# Limpieza inicial de Docker
 clean_unused_images()
 clean_unused_containers()
 
@@ -34,7 +36,7 @@ def init_gemini() -> str:
 
 st.set_page_config(page_title="Generador de Código Python", layout="wide")
 
-# Verificación inicial
+# Verificación inicial de Docker
 docker_init_message = init_docker()
 if "Error" in docker_init_message:
     st.error(docker_init_message, icon="❌")
@@ -54,42 +56,122 @@ st.markdown("""
 
 # Inicialización de estado
 _ = init_gemini()
-for key in ["attempts", "execution_history", "generated_files", "results_available", "formatted_report", 
-            "execution_result", "preview_active", "preview_file", "preview_content", "all_files", "parallel_results"]:
+for key in [
+    "attempts", "execution_history", "generated_files", "results_available", 
+    "formatted_report", "execution_result", "all_files", "parallel_results", 
+    "cleaned_code", "user_prompt"
+]:
     if key not in st.session_state:
-        st.session_state[key] = [] if key in ["execution_history", "parallel_results"] else {} if key in ["generated_files", "execution_result", "all_files"] else False if key in ["results_available", "preview_active"] else None if key in ["preview_file", "preview_content", "formatted_report"] else 0
+        if key in ["execution_history", "parallel_results"]:
+            st.session_state[key] = []
+        elif key in ["generated_files", "execution_result", "all_files"]:
+            st.session_state[key] = {}
+        elif key in ["results_available"]:
+            st.session_state[key] = False
+        elif key in ["formatted_report", "cleaned_code", "user_prompt"]:
+            st.session_state[key] = ""  # Inicializamos como string vacío en lugar de None
+        else:
+            st.session_state[key] = 0
 
-# Funciones auxiliares
-def show_file_preview(file_name: str, file_content: bytes) -> None:
-    st.session_state.preview_file = file_name
-    st.session_state.preview_content = file_content
-    st.session_state.preview_active = True
+def process_report_content(report: str, files_dict: Dict[str, bytes]) -> List[Dict]:
+    """
+    Procesa el texto del reporte buscando marcas de archivo con la sintaxis {{nombre_archivo}}
+    y separa el contenido en partes: texto o archivo.
+    """
+    if not isinstance(report, str):  # Manejo de None o tipos no válidos
+        return [{"type": "text", "content": "No se generó un reporte válido."}]
+    
+    parts = []
+    file_marker_regex = re.compile(r"\{\{(.+?)\}\}")
+    last_end = 0
+    for match in file_marker_regex.finditer(report):
+        start, end = match.span()
+        text_chunk = report[last_end:start].strip()
+        if text_chunk:
+            parts.append({"type": "text", "content": text_chunk})
+        file_name = match.group(1)
+        parts.append({
+            "type": "file",
+            "name": file_name,
+            "content": files_dict.get(file_name, b"Archivo no encontrado")
+        })
+        last_end = end
+    if last_end < len(report):
+        parts.append({"type": "text", "content": report[last_end:].strip()})
+    return parts
 
-def close_file_preview() -> None:
-    st.session_state.preview_file = None
-    st.session_state.preview_content = None
-    st.session_state.preview_active = False
+def display_processed_report(processed_report: List[Dict]) -> None:
+    """
+    Muestra en pantalla las partes del reporte procesado. 
+    Cuando se trata de un archivo, lo previsualiza según su tipo.
+    """
+    for item in processed_report:
+        if item["type"] == "text":
+            st.markdown(item["content"], unsafe_allow_html=True)
+        else:
+            file_name, file_content = item["name"], item["content"]
+            st.subheader(f"Archivo: {file_name}")
+            preview_file(file_name, file_content)
 
-def display_file_preview() -> None:
-    if not st.session_state.preview_active or not st.session_state.preview_file:
-        return
-    file_name = st.session_state.preview_file
-    file_content = st.session_state.preview_content
-    st.subheader(file_name)
+def preview_file(file_name: str, content: bytes) -> None:
+    """
+    Previsualiza el archivo según su extensión.
+    - Para GIF se re-guarda el GIF forzando bucle infinito (loop=0) y se muestra con HTML embebido.
+    - Para otras imágenes, CSV, Excel, Video, Audio y PDF se utilizan los métodos correspondientes.
+    - Para archivos .py se muestra como código.
+    - Para otros tipos, se intenta mostrar como texto; si no es posible, se notifica.
+    """
     file_ext = file_name.split('.')[-1].lower()
-    if file_ext in ['png', 'jpg', 'jpeg', 'gif']:
-        st.image(file_content, caption=file_name)
+
+    if file_ext == 'gif':
+        try:
+            image = Image.open(io.BytesIO(content))
+            with io.BytesIO() as output:
+                image.save(output, format='GIF', save_all=True, loop=0)
+                gif_looped = output.getvalue()
+            gif_data = base64.b64encode(gif_looped).decode("utf-8")
+        except Exception as e:
+            gif_data = base64.b64encode(content).decode("utf-8")
+        st.markdown(
+            f'<img src="data:image/gif;base64,{gif_data}" alt="{file_name}" />',
+            unsafe_allow_html=True
+        )
+    elif file_ext in ['png', 'jpg', 'jpeg', 'webp', 'tiff']:
+        st.image(content, caption=file_name)
     elif file_ext == 'csv':
         try:
-            df = pd.read_csv(io.BytesIO(file_content))
+            df = pd.read_csv(io.BytesIO(content))
             st.dataframe(df)
         except Exception as e:
             st.error(f"Error al mostrar CSV: {e}")
+    elif file_ext in ['xls', 'xlsx']:
+        try:
+            df = pd.read_excel(io.BytesIO(content))
+            st.dataframe(df)
+        except Exception as e:
+            st.error(f"Error al mostrar Excel: {e}")
+    elif file_ext in ['mp4', 'mov', 'avi', 'mkv', 'webm']:
+        st.video(io.BytesIO(content))
+    elif file_ext in ['mp3', 'wav', 'ogg', 'flac', 'm4a']:
+        st.audio(io.BytesIO(content))
+    elif file_ext == 'pdf':
+        try:
+            base64_pdf = base64.b64encode(content).decode('utf-8')
+            pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="700" height="900" type="application/pdf"></iframe>'
+            st.markdown(pdf_display, unsafe_allow_html=True)
+        except Exception as e:
+            st.warning("No se pudo previsualizar el PDF, descárgalo para verlo localmente.")
     elif file_ext == 'py':
-        st.code(file_content.decode('utf-8', errors='ignore'), language='python')
+        st.code(content.decode('utf-8', errors='ignore'), language='python')
     else:
-        st.text_area("Contenido", file_content.decode('utf-8', errors='ignore'), height=300)
-    st.button("Cerrar Vista Previa", on_click=close_file_preview)
+        try:
+            text = content.decode('utf-8', errors='ignore')
+            if text.strip():
+                st.text_area("Contenido", text, height=300)
+            else:
+                st.warning("El archivo está vacío o no se puede previsualizar correctamente.")
+        except Exception:
+            st.warning("No se puede previsualizar este tipo de archivo. Por favor, descárgalo para revisarlo.")
 
 class FileBrowser:
     def __init__(self, files_dict: Dict[str, bytes]):
@@ -100,47 +182,20 @@ class FileBrowser:
             st.info("No se han generado archivos aún.", icon="ℹ️")
             return
         for file_name, content in self.files_dict.items():
-            col1, col2 = st.columns([4, 1])
-            col1.button(f"📄 {file_name}", key=f"preview_{file_name}", on_click=show_file_preview, args=(file_name, content))
-            col2.download_button("⬇️", data=content, file_name=file_name, key=f"dl_{file_name}")
+            with st.expander(f"📄 {file_name}", expanded=False):
+                preview_file(file_name, content)
+                st.download_button(
+                    label="⬇️ Descargar",
+                    data=content,
+                    file_name=file_name,
+                    key=f"dl_{file_name}"
+                )
 
-def process_report_content(report: str, files_dict: Dict[str, bytes]) -> List[Dict]:
-    parts = []
-    file_marker_regex = re.compile(r"\{\{(.+?)\}\}")
-    last_end = 0
-    for match in file_marker_regex.finditer(report):
-        start, end = match.span()
-        text_chunk = report[last_end:start].strip()
-        if text_chunk:
-            parts.append({"type": "text", "content": text_chunk})
-        file_name = match.group(1)
-        parts.append({"type": "file", "name": file_name, "content": files_dict.get(file_name, b"Archivo no encontrado")})
-        last_end = end
-    if last_end < len(report):
-        parts.append({"type": "text", "content": report[last_end:].strip()})
-    return parts
-
-def display_processed_report(processed_report: List[Dict]) -> None:
-    for item in processed_report:
-        if item["type"] == "text":
-            st.markdown(item["content"], unsafe_allow_html=True)
-        else:
-            file_name, file_content = item["name"], item["content"]
-            st.subheader(f"Archivo: {file_name}")
-            file_ext = file_name.split('.')[-1].lower()
-            if file_ext in ['png', 'jpg', 'jpeg', 'gif']:
-                st.image(file_content, caption=file_name)
-            elif file_ext == 'csv':
-                try:
-                    df = pd.read_csv(io.BytesIO(file_content))
-                    st.dataframe(df)
-                except Exception as e:
-                    st.error(f"Error al mostrar CSV: {e}")
-            else:
-                st.text_area("Contenido", file_content.decode('utf-8', errors='ignore'), height=300)
-
-# Funciones principales
 def generate_and_execute(task_id: int, input_files: Dict[str, bytes], prompt: str) -> Dict:
+    """
+    Intenta generar y ejecutar el código hasta 3 veces. 
+    Retorna un diccionario con la información de la ejecución y archivos generados.
+    """
     enhanced_prompt = f"{prompt}\n\nManeja casos donde los archivos estén vacíos o no contengan datos esperados."
     max_attempts = 5
     for attempt in range(max_attempts):
@@ -149,6 +204,7 @@ def generate_and_execute(task_id: int, input_files: Dict[str, bytes], prompt: st
         dependencies = response.get("dependencies", "")
         if not code.strip():
             continue
+        
         cleaned_code = clean_code(code)
         try:
             ast.parse(cleaned_code)
@@ -171,13 +227,22 @@ def generate_and_execute(task_id: int, input_files: Dict[str, bytes], prompt: st
                 }
         except SyntaxError:
             continue
-    return {"task_id": task_id, "attempts": max_attempts, "execution_result": {}, "is_successful": False}
+    return {
+        "task_id": task_id, 
+        "attempts": max_attempts, 
+        "execution_result": {}, 
+        "is_successful": False
+    }
 
 def parallel_execution() -> None:
+    """
+    Ejecuta en paralelo 7 tareas de generación y ejecución de código.
+    Luego rankea las soluciones exitosas y selecciona la mejor.
+    """
     st.session_state.parallel_results = []
-    num_executions = 5
+    num_executions = 7
     uploaded_files = st.session_state.get("user_files", [])
-    input_files = {file.name: file.read() for file in uploaded_files}
+    input_files = {file.name: file.read() for file in uploaded_files} if uploaded_files else {}
     prompt = st.session_state["user_prompt"]
     
     temp_root = os.path.join(os.getcwd(), ".temp")
@@ -185,7 +250,10 @@ def parallel_execution() -> None:
     
     with st.spinner("Ejecutando tareas en paralelo..."):
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_executions) as executor:
-            futures = {executor.submit(generate_and_execute, i + 1, input_files, prompt): i + 1 for i in range(num_executions)}
+            futures = {
+                executor.submit(generate_and_execute, i + 1, input_files, prompt): i + 1 
+                for i in range(num_executions)
+            }
             results = []
             for future in concurrent.futures.as_completed(futures):
                 result = future.result()
@@ -199,14 +267,23 @@ def parallel_execution() -> None:
                         f.write(result["code"])
                     with open(os.path.join(temp_dir, "requirements.txt"), "w") as f:
                         f.write(result["dependencies"])
-                    for file_name, content in result["generated_files"].items():
+                    for file_name, file_content in result["generated_files"].items():
                         file_path = os.path.join(temp_dir, file_name)
                         with open(file_path, "wb") as f:
-                            f.write(content if isinstance(content, bytes) else content.encode('utf-8'))
+                            if isinstance(file_content, bytes):
+                                f.write(file_content)
+                            else:
+                                f.write(file_content.encode('utf-8'))
                     
-                    st.success(f"Tarea {result['task_id']}: Ejecutada exitosamente. Archivos en {temp_dir}", icon="✅")
+                    st.success(
+                        f"Tarea {result['task_id']}: Ejecutada exitosamente. Archivos en {temp_dir}",
+                        icon="✅"
+                    )
                 else:
-                    st.error(f"Tarea {result['task_id']}: Falló tras {result['attempts']} intentos.", icon="❌")
+                    st.error(
+                        f"Tarea {result['task_id']}: Falló tras {result['attempts']} intentos.",
+                        icon="❌"
+                    )
                 results.append(result)
     
     successful_results = [r for r in results if r.get("is_successful", False)]
@@ -228,19 +305,38 @@ def parallel_execution() -> None:
     st.session_state.cleaned_code = best_result["code"]
     st.session_state.execution_result = best_result["execution_result"]
     st.session_state.all_files = best_result["all_files"]
-    st.session_state.formatted_report = generate_report(prompt, best_result["code"], best_result["execution_result"].get("stdout", ""), best_result["generated_files"])
-    st.success(f"Tarea {best_result['task_id']} obtuvo la mejor suma de rankings ({sum_rankings[best_index]}).", icon="🏆")
+    
+    # Generar el reporte y asegurarse de que sea un string
+    report = generate_report(
+        prompt,
+        "El plan se derivó implícitamente en el código generado.",
+        best_result["code"],
+        best_result["execution_result"].get("stdout", ""),
+        best_result["all_files"]
+    )
+    st.session_state.formatted_report = report if isinstance(report, str) else "No se pudo generar el reporte."
+    
+    st.success(
+        f"Tarea {best_result['task_id']} obtuvo la mejor suma de rankings ({sum_rankings[best_index]}).", 
+        icon="🏆"
+    )
     st.session_state.parallel_results = results
 
 # Interfaz principal
-if st.session_state.preview_active:
-    display_file_preview()
-
 st.subheader("📝 Describe tu Tarea")
-st.text_area("Escribe qué quieres que haga el código:", key="user_prompt", height=150, placeholder="Ejemplo: 'Generar un gráfico de barras a partir de un CSV.'")
+st.text_area(
+    "Escribe qué quieres que haga el código:", 
+    key="user_prompt", 
+    height=150, 
+    placeholder="Ejemplo: 'Generar un gráfico de barras a partir de un CSV.'"
+)
 
 st.subheader("📂 Sube Archivos (Opcional)")
-st.file_uploader("Archivos necesarios para el script:", accept_multiple_files=True, key="user_files")
+st.file_uploader(
+    "Archivos necesarios para el script:", 
+    accept_multiple_files=True, 
+    key="user_files"
+)
 
 if st.button("🚀 Generar y Ejecutar (Paralelo)"):
     parallel_execution()
@@ -250,23 +346,37 @@ if st.session_state.results_available:
     col_report, col_files = st.columns([5, 3])
     with col_report:
         st.subheader("📋 Reporte")
-        processed_report = process_report_content(st.session_state.formatted_report, st.session_state.generated_files)
+        processed_report = process_report_content(
+            st.session_state.formatted_report, 
+            st.session_state.generated_files
+        )
         display_processed_report(processed_report)
     with col_files:
         st.subheader("📁 Archivos Generados")
         FileBrowser(st.session_state.generated_files).render()
+        
         if st.session_state.generated_files:
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w") as zipf:
-                for name, content in st.session_state.generated_files.items():
-                    zipf.writestr(name, content if isinstance(content, bytes) else content.encode('utf-8'))
+                for name, file_content in st.session_state.generated_files.items():
+                    if isinstance(file_content, bytes):
+                        zipf.writestr(name, file_content)
+                    else:
+                        zipf.writestr(name, file_content.encode('utf-8'))
             zip_buffer.seek(0)
-            st.download_button("⬇️ Descargar Todo (ZIP)", zip_buffer, "generated_files.zip", "application/zip")
+            st.download_button(
+                "⬇️ Descargar Todo (ZIP)", 
+                zip_buffer, 
+                "generated_files.zip", 
+                "application/zip"
+            )
 
 # Resultados paralelos
 if st.session_state.parallel_results:
     st.subheader("📊 Resultados Paralelos")
-    successful_results = [r for r in st.session_state.parallel_results if r.get("is_successful", False)]
+    successful_results = [
+        r for r in st.session_state.parallel_results if r.get("is_successful", False)
+    ]
     rankings = []
     if successful_results:
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -274,12 +384,18 @@ if st.session_state.parallel_results:
             rankings = [f.result() for f in concurrent.futures.as_completed(futures)]
     
     data = []
-    sum_rankings = [sum(r[i] for r in rankings) for i in range(len(successful_results))] if rankings else []
+    sum_rankings = (
+        [sum(r[i] for r in rankings) for i in range(len(successful_results))]
+        if rankings else []
+    )
     for result in st.session_state.parallel_results:
         row = {"Tarea": result['task_id'], "Intentos": result['attempts']}
         if result.get("is_successful", False):
             idx = successful_results.index(result)
-            row.update({"Suma de Rankings": sum_rankings[idx], "Rankings": ", ".join(map(str, [r[idx] for r in rankings]))})
+            row.update({
+                "Suma de Rankings": sum_rankings[idx], 
+                "Rankings": ", ".join(map(str, [r[idx] for r in rankings]))
+            })
         else:
             row.update({"Suma de Rankings": "N/A", "Rankings": "N/A"})
         data.append(row)
@@ -293,13 +409,27 @@ if st.session_state.parallel_results:
             st.text(result["execution_result"].get("stdout", ""))
             if result["execution_result"].get("stderr"):
                 st.text(result["execution_result"]["stderr"])
-            for file_name, content in result["generated_files"].items():
-                st.download_button(f"⬇️ {file_name}", content, file_name, key=f"dl_{result['task_id']}_{file_name}")
+            
+            for file_name, file_content in result["generated_files"].items():
+                st.download_button(
+                    f"⬇️ {file_name}", 
+                    file_content, 
+                    file_name, 
+                    key=f"dl_{result['task_id']}_{file_name}"
+                )
+            
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w") as zipf:
                 zipf.writestr("script.py", result["code"])
                 zipf.writestr("requirements.txt", result["dependencies"])
-                for name, content in result["generated_files"].items():
-                    zipf.writestr(name, content if isinstance(content, bytes) else content.encode('utf-8'))
+                for name, fc in result["generated_files"].items():
+                    if isinstance(fc, bytes):
+                        zipf.writestr(name, fc)
+                    else:
+                        zipf.writestr(name, fc.encode('utf-8'))
             zip_buffer.seek(0)
-            st.download_button(f"⬇️ Todo (ZIP) - Tarea {result['task_id']}", zip_buffer, f"tarea_{result['task_id']}_files.zip")
+            st.download_button(
+                f"⬇️ Todo (ZIP) - Tarea {result['task_id']}", 
+                zip_buffer, 
+                f"tarea_{result['task_id']}_files.zip"
+            )
