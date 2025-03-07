@@ -4,7 +4,7 @@ import os
 import hashlib
 import requests
 
-from gemini_client import validate_requirements_format
+#from gemini_client import validate_requirements_format
 
 BASE_IMAGE_NAME = "python_executor:latest"
 BASE_IMAGE_BUILT = False
@@ -58,9 +58,9 @@ def get_or_create_cached_image(dependencies: str) -> str:
     cleaned_dependencies = '\n'.join(dep_lines)
     
     # Validar y corregir el formato de requirements.txt usando Gemini
-    corrected_dependencies = validate_requirements_format(cleaned_dependencies)
+    #corrected_dependencies = validate_requirements_format(cleaned_dependencies)
     
-    dep_hash = hashlib.sha256(corrected_dependencies.encode("utf-8")).hexdigest()[:12]
+    dep_hash = hashlib.sha256(cleaned_dependencies.encode("utf-8")).hexdigest()[:12]
     cached_image_name = f"python_executor_cache:{dep_hash}"
     client = docker.DockerClient()
 
@@ -81,8 +81,8 @@ def get_or_create_cached_image(dependencies: str) -> str:
                 f.write(dockerfile_content.strip())
             req_path = os.path.join(tmpdir, "requirements.txt")
             with open(req_path, "w") as f:
-                f.write(corrected_dependencies)
-            print(f"Contenido de requirements.txt:\n{corrected_dependencies}")
+                f.write(cleaned_dependencies)
+            print(f"Contenido de requirements.txt:\n{cleaned_dependencies}")
             try:
                 print(f"Construyendo imagen para dependencias: {cached_image_name}")
                 image, logs = client.images.build(path=tmpdir, tag=cached_image_name)
