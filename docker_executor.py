@@ -1,66 +1,70 @@
+import threading
+import time
 import docker
 import tempfile
 import os
 import hashlib
+import logging
 import requests
 
+# Configurar logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 BASE_IMAGE_NAME = "python_executor:latest"
-BASE_IMAGE_BUILT = False
 
 def initialize_docker_image():
-    global BASE_IMAGE_BUILT
-    if BASE_IMAGE_BUILT:
-        return "Imagen Docker base ya existente (cached)."
-
-    try:
-        client = docker.DockerClient()
-    except Exception as e:
-        return f"Error al conectar con el daemon de Docker: {e}. Asegúrate de que Docker esté corriendo."
-
+    """Inicializa la imagen base de Docker si no existe."""
+    client = docker.from_env()
     try:
         client.images.get(BASE_IMAGE_NAME)
-        BASE_IMAGE_BUILT = True
+        logging.info("Imagen Docker base ya existente.")
         return "Imagen Docker base ya existente."
     except docker.errors.ImageNotFound:
         try:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             dockerfile_path = os.path.join(script_dir, "executor")
             if not os.path.exists(dockerfile_path):
-                return f"Error: El directorio {dockerfile_path} no existe o no contiene un Dockerfile."
-            print(f"Construyendo imagen Docker base desde {dockerfile_path}...")
+                error_msg = f"Error: El directorio {dockerfile_path} no existe o no contiene un Dockerfile."
+                logging.error(error_msg)
+                return error_msg
+            logging.info(f"Construyendo imagen Docker base desde {dockerfile_path}...")
             image, logs = client.images.build(path=dockerfile_path, tag=BASE_IMAGE_NAME)
             for item in logs:
-                print(item.get('stream', ''))
-            BASE_IMAGE_BUILT = True
+                logging.info(item.get('stream', ''))
             return "Imagen Docker base construida exitosamente."
         except Exception as e:
-            return f"Error al construir la imagen Docker: {e}"
+            error_msg = f"Error al construir la imagen Docker: {e}"
+            logging.error(error_msg)
+            return error_msg
+    except Exception as e:
+        error_msg = f"Error al conectar con el daemon de Docker: {e}. Asegúrate de que Docker esté corriendo."
+        logging.error(error_msg)
+        return error_msg
 
 def get_or_create_cached_image(dependencies: str) -> str:
+    """Obtiene o crea una imagen Docker con las dependencias especificadas."""
     if not dependencies.strip():
-        print("No se especificaron dependencias, usando imagen base.")
+        logging.info("No se especificaron dependencias, usando imagen base.")
         return BASE_IMAGE_NAME
 
-    # Procesar dependencias para asegurar el formato correcto
     dep_lines = []
     for line in dependencies.split('\n'):
         line = line.strip()
         if line:
-            # Dividir por comas y limpiar cada entrada
             deps = [dep.strip() for dep in line.split(',') if dep.strip()]
             dep_lines.extend(deps)
     if not dep_lines:
-        print("Advertencia: dependencies está vacío después de limpiar, usando imagen base.")
+        logging.warning("Advertencia: dependencies está vacío después de limpiar, usando imagen base.")
         return BASE_IMAGE_NAME
     cleaned_dependencies = '\n'.join(dep_lines)
     
     dep_hash = hashlib.sha256(cleaned_dependencies.encode("utf-8")).hexdigest()[:12]
     cached_image_name = f"python_executor_cache:{dep_hash}"
-    client = docker.DockerClient()
+    client = docker.from_env()
 
     try:
         client.images.get(cached_image_name)
-        print(f"Imagen encontrada: {cached_image_name}")
+        logging.info(f"Imagen encontrada: {cached_image_name}")
         return cached_image_name
     except docker.errors.ImageNotFound:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -76,42 +80,56 @@ def get_or_create_cached_image(dependencies: str) -> str:
             req_path = os.path.join(tmpdir, "requirements.txt")
             with open(req_path, "w") as f:
                 f.write(cleaned_dependencies)
-            print(f"Contenido de requirements.txt:\n{cleaned_dependencies}")
+            logging.info(f"Contenido de requirements.txt:\n{cleaned_dependencies}")
             try:
-                print(f"Construyendo imagen para dependencias: {cached_image_name}")
+                logging.info(f"Construyendo imagen para dependencias: {cached_image_name}")
                 image, logs = client.images.build(path=tmpdir, tag=cached_image_name)
                 for item in logs:
-                    print(item.get('stream', ''))
+                    logging.info(item.get('stream', ''))
                 return cached_image_name
             except Exception as e:
-                print(f"Error al construir imagen con dependencias: {e}")
+                logging.error(f"Error al construir imagen con dependencias: {e}")
                 return BASE_IMAGE_NAME
 
+client = docker.from_env(timeout=120)
+
+def background_clean_images():
+    """Ejecuta la limpieza de imágenes no utilizadas en segundo plano."""
+    threading.Thread(target=clean_unused_images).start()
+
+def background_clean_containers():
+    """Ejecuta la limpieza de contenedores no utilizados en segundo plano."""
+    threading.Thread(target=clean_unused_containers).start()
+
 def clean_unused_images():
-    client = docker.DockerClient()
+    """Limpia imágenes Docker no utilizadas."""
     try:
-        images = client.images.list(filters={"reference": "python_executor_cache:*"})
-        for image in images:
-            print(f"Eliminando imagen: {image.tags[0]}")
-            client.images.remove(image.id, force=True)
-        print("Imágenes cacheadas eliminadas.")
-    except Exception as e:
-        print(f"Error al limpiar imágenes: {e}")
+        pruned = client.images.prune(filters={"dangling": True})
+        logging.info(f"Imágenes cacheadas eliminadas: {pruned}")
+    except docker.errors.APIError as e:
+        if e.status_code == 409:
+            logging.warning("Operación de limpieza ya en curso. Esperando 5 segundos...")
+            time.sleep(5)
+            clean_unused_images()
+        else:
+            logging.error(f"Error al limpiar imágenes: {e}")
 
 def clean_unused_containers():
-    client = docker.DockerClient()
+    """Limpia contenedores Docker no utilizados."""
     try:
-        containers = client.containers.list(all=True, filters={"status": "exited"})
-        for container in containers:
-            if container.image.tags and any("python_executor" in tag for tag in container.image.tags):
-                print(f"Eliminando contenedor: {container.id}")
-                container.remove(force=True)
-        print("Contenedores no utilizados eliminados.")
-    except Exception as e:
-        print(f"Error al limpiar contenedores: {e}")
+        client.containers.prune()
+        logging.info("Contenedores no utilizados eliminados.")
+    except docker.errors.APIError as e:
+        if e.status_code == 409:
+            logging.warning("Operación de limpieza ya en curso. Esperando 5 segundos...")
+            time.sleep(5)
+            clean_unused_containers()
+        else:
+            logging.error(f"Error al limpiar contenedores: {e}")
 
 def execute_code_in_docker(code: str, input_files: dict, dependencies: str = None) -> dict:
-    client = docker.DockerClient()
+    """Ejecuta código Python en un contenedor Docker."""
+    client = docker.from_env()
     image = get_or_create_cached_image(dependencies) if dependencies else BASE_IMAGE_NAME
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -121,12 +139,16 @@ def execute_code_in_docker(code: str, input_files: dict, dependencies: str = Non
 
         for filename, content in input_files.items():
             file_path = os.path.join(temp_dir, filename)
-            if isinstance(content, str):
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-            else:
-                with open(file_path, "wb") as f:
-                    f.write(content)
+            try:
+                if isinstance(content, str):
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                else:
+                    with open(file_path, "wb") as f:
+                        f.write(content)
+            except Exception as e:
+                logging.error(f"Error al escribir archivo {filename}: {e}")
+                return {"stdout": "", "stderr": f"Error al escribir archivo {filename}: {e}", "files": {}}
 
         container = None
         try:
@@ -151,16 +173,20 @@ def execute_code_in_docker(code: str, input_files: dict, dependencies: str = Non
                     stderr = f.read()
 
         except Exception as e:
+            logging.error(f"Error al ejecutar código en Docker: {e}")
             return {"stdout": "", "stderr": str(e), "files": {}}
         finally:
             if container:
-                container.stop()
-                container.remove(force=True)
+                try:
+                    container.stop()
+                    container.remove(force=True)
+                except Exception as e:
+                    logging.error(f"Error al eliminar contenedor: {e}")
 
         generated_files = {}
         for root, _, files in os.walk(temp_dir):
             for file in files:
-                if file == "error.log":
+                if file in ["error.log", "script.py"]:
                     continue
                 file_path = os.path.join(root, file)
                 with open(file_path, "rb") as f:
