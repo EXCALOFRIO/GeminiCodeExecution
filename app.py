@@ -120,8 +120,8 @@ body {
 
 # Inicialización del estado de la sesión
 for key in [
-    "attempts", "execution_history", "generated_files", "results_available", 
-    "formatted_report", "execution_result", "all_files", "parallel_results", 
+    "attempts", "execution_history", "generated_files", "results_available",
+    "formatted_report", "execution_result", "all_files", "parallel_results",
     "cleaned_code", "user_prompt", "checklist_data", "overall_start_time"
 ]:
     if key not in st.session_state:
@@ -260,8 +260,8 @@ def generate_and_execute(
 ) -> Dict:
     """Genera y ejecuta código con múltiples intentos, enviando actualizaciones a la cola."""
     max_attempts = 5
-    temp_dir = os.path.join(os.getcwd(), f".temp/task_{task_id}")
-    os.makedirs(temp_dir, exist_ok=True)
+    #temp_dir = os.path.join(os.getcwd(), f".temp/task_{task_id}")
+    #os.makedirs(temp_dir, exist_ok=True)
     last_error = ""
 
     for attempt in range(1, max_attempts + 1):
@@ -272,29 +272,29 @@ def generate_and_execute(
         status_queue.put((task_id, "Actualizar checklist"))
 
         # Guardar prompt original
-        with open(os.path.join(temp_dir, "prompt_original.txt"), "w", encoding="utf-8") as f:
-            f.write(prompt)
+        #with open(os.path.join(temp_dir, "prompt_original.txt"), "w", encoding="utf-8") as f:
+        #    f.write(prompt)
         update_checklist_status(checklist_data, task_id, "Guardar prompt original", f"✅ Completado - Tiempo: {get_elapsed_time(start_time)}")
         status_queue.put((task_id, "Actualizar checklist"))
 
         # Analizar archivos
         files_context = analyze_files_context(input_files)
-        with open(os.path.join(temp_dir, "files_analysis.txt"), "w", encoding="utf-8") as f:
-            f.write(str(files_context))
+        #with open(os.path.join(temp_dir, "files_analysis.txt"), "w", encoding="utf-8") as f:
+        #    f.write(str(files_context))
         update_checklist_status(checklist_data, task_id, "Analizar archivos", f"✅ Completado - Tiempo: {get_elapsed_time(start_time)}")
         status_queue.put((task_id, "Actualizar checklist"))
 
         # Mejorar prompt
         improved_prompt = improve_prompt(prompt, input_files)
-        with open(os.path.join(temp_dir, "prompt_mejorado.txt"), "w", encoding="utf-8") as f:
-            f.write(improved_prompt)
+        #with open(os.path.join(temp_dir, "prompt_mejorado.txt"), "w", encoding="utf-8") as f:
+        #    f.write(improved_prompt)
         update_checklist_status(checklist_data, task_id, "Mejorar prompt", f"✅ Completado - Tiempo: {get_elapsed_time(start_time)}")
         status_queue.put((task_id, "Actualizar checklist"))
 
         # Generar plan
         plan = generate_plan(improved_prompt, input_files)
-        with open(os.path.join(temp_dir, "plan.txt"), "w", encoding="utf-8") as f:
-            f.write(plan)
+        #with open(os.path.join(temp_dir, "plan.txt"), "w", encoding="utf-8") as f:
+        #    f.write(plan)
         update_checklist_status(checklist_data, task_id, "Generar plan", f"✅ Completado - Tiempo: {get_elapsed_time(start_time)}")
         status_queue.put((task_id, "Actualizar checklist"))
 
@@ -402,8 +402,8 @@ def parallel_execution() -> None:
     prompt = st.session_state["user_prompt"]
 
     st.session_state.overall_start_time = time.time()
-    temp_root = os.path.join(os.getcwd(), ".temp")
-    os.makedirs(temp_root, exist_ok=True)
+    #temp_root = os.path.join(os.getcwd(), ".temp")
+    #os.makedirs(temp_root, exist_ok=True)
 
     # Elementos de la interfaz
     progress_bar = st.empty()
