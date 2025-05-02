@@ -1,0 +1,15 @@
+{
+  "name": "gemini-code-execution-backend",
+  "version": "1.0.0",
+  "description": "Backend para la ejecución de código con Gemini AI",
+  "main": "main.py",
+  "scripts": {
+    "start": "uvicorn main:socket_app --host 127.0.0.1 --port 8080",
+    "dev": "uvicorn main:socket_app --host 127.0.0.1 --port 8080 --reload"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "gemini-code-execution-backend": "file:"
+  }
+}
